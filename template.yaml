@@ -1,0 +1,154 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  Personal health data backend on a Lambda Function URL: an MCP server (Streamable HTTP, stateless)
+  with Oura Ring and health-metric tools, plus an Apple Health (Health Auto Export) ingest endpoint.
+  Auth is long random secrets in SSM. Health readings live in one on-demand DynamoDB table.
+
+Parameters:
+  ParamPrefix:
+    Type: String
+    Default: /oura-mcp
+    AllowedPattern: '^/[A-Za-z0-9_.\-/]+[A-Za-z0-9_.\-]$'
+    Description: SSM path holding path-secret, ingest-path-secret, ingest-key, oauth-client and tokens (all SecureString).
+  UserTimezone:
+    Type: String
+    Default: UTC
+    Description: IANA timezone of the ring owner (e.g. America/Los_Angeles). Used to bucket heart-rate samples into days.
+  ReservedConcurrency:
+    Type: Number
+    Default: 2
+    MinValue: 0
+    Description: Reserved concurrency for the function (0 = none; needed on accounts whose concurrency quota is still 10).
+  BudgetEmail:
+    Type: String
+    AllowedPattern: '^[^@\s]+@[^@\s]+\.[^@\s]+$'
+    Description: Where AWS Budgets sends the cost alerts.
+  BudgetLimitUsd:
+    Type: Number
+    Default: 1
+    Description: Monthly account-wide cost budget in USD.
+  AllowTestClock:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Lets the ingest endpoint honor the x-smoke-test-now header (scripts/health-smoke.sh, test data before 2010 only).
+
+Conditions:
+  HasReservedConcurrency: !Not [!Equals [!Ref ReservedConcurrency, 0]]
+
+Resources:
+  McpFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints: [src/handler.ts]
+        Format: esm
+        OutExtension: [.js=.mjs]
+        Target: node24
+        Platform: node
+        Minify: true
+        Sourcemap: false
+        # The Lambda runtime ships AWS SDK v3; do not bundle it.
+        External: ['@aws-sdk/*']
+        # Bundled CJS dependencies may call require() on Node builtins.
+        Banner:
+          - js=import { createRequire } from 'node:module'; const require = createRequire(import.meta.url);
+    Properties:
+      Description: Health MCP server (Oura + health metrics) and Apple Health ingest
+      Runtime: nodejs24.x
+      Architectures: [arm64]
+      Handler: handler.handler
+      MemorySize: 256
+      Timeout: 30
+      ReservedConcurrentExecutions: !If [HasReservedConcurrency, !Ref ReservedConcurrency, !Ref AWS::NoValue]
+      LoggingConfig:
+        LogGroup: !Ref McpLogGroup
+        LogFormat: Text
+      Environment:
+        Variables:
+          PARAM_PREFIX: !Ref ParamPrefix
+          USER_TZ: !Ref UserTimezone
+          TABLE_NAME: !Ref HealthTable
+          ALLOW_TEST_CLOCK: !Ref AllowTestClock
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ParamPrefix}/*
+            # Only the token pair is writable (refresh-token rotation).
+            - Effect: Allow
+              Action: ssm:PutParameter
+              Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ParamPrefix}/tokens
+            # Exactly the calls the code makes, on this table only (no scans, no indexes).
+            - Effect: Allow
+              Action:
+                - dynamodb:Query
+                - dynamodb:PutItem
+                - dynamodb:DeleteItem
+                - dynamodb:BatchWriteItem
+              Resource: !GetAtt HealthTable.Arn
+      FunctionUrlConfig:
+        AuthType: NONE # the path secret is the credential; checked in code
+        InvokeMode: BUFFERED
+
+  # PK metric (weight, bp, glucose, ketones, protein, carbs, calories), SK UTC ISO 8601 timestamp
+  # (e.g. 2026-09-27T14:30:00Z). Same metric + ts overwrites. Retained if the stack is deleted,
+  # because it holds health history that exists nowhere else for chat-logged readings.
+  HealthTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      # Continuous backups, restorable to any second in the last 35 days ($0.20/GB-month;
+      # this table is a few MB). Restore procedure: docs/RUNBOOK.md.
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - { AttributeName: metric, AttributeType: S }
+        - { AttributeName: ts, AttributeType: S }
+      KeySchema:
+        - { AttributeName: metric, KeyType: HASH }
+        - { AttributeName: ts, KeyType: RANGE }
+
+  McpLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-mcp
+      RetentionInDays: 14
+
+  # Account-wide monthly cost budget: emails at 50% and 100% actual, and 100% forecast.
+  CostBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        # Fixed name: a name change forces CloudFormation to replace the budget.
+        BudgetName: !Sub ${AWS::StackName}-monthly-cost
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !Ref BudgetLimitUsd
+          Unit: USD
+      NotificationsWithSubscribers:
+        - Notification: { NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 50, ThresholdType: PERCENTAGE }
+          Subscribers: [{ SubscriptionType: EMAIL, Address: !Ref BudgetEmail }]
+        - Notification: { NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 100, ThresholdType: PERCENTAGE }
+          Subscribers: [{ SubscriptionType: EMAIL, Address: !Ref BudgetEmail }]
+        - Notification: { NotificationType: FORECASTED, ComparisonOperator: GREATER_THAN, Threshold: 100, ThresholdType: PERCENTAGE }
+          Subscribers: [{ SubscriptionType: EMAIL, Address: !Ref BudgetEmail }]
+
+Outputs:
+  FunctionUrl:
+    Description: >-
+      Base Function URL. MCP is <FunctionUrl>mcp/<path-secret> (`npm run url`); Apple Health ingest is
+      POST <FunctionUrl>ingest/<ingest-path-secret> with header X-Ingest-Key (`npm run ingest-url`).
+    Value: !GetAtt McpFunctionUrl.FunctionUrl
+  HealthTableName:
+    Value: !Ref HealthTable
+  FunctionName:
+    Value: !Ref McpFunction
+  LogGroup:
+    Value: !Ref McpLogGroup

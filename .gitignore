@@ -1,0 +1,11 @@
+node_modules/
+.aws-sam/
+.DS_Store
+*.log
+
+# Personal settings and notes: never commit these.
+deploy.env
+.env
+.env.*
+samconfig.toml
+private/

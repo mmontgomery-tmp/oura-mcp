@@ -1,0 +1,38 @@
+{
+  "name": "oura-mcp",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "node --test test/*.test.ts",
+    "typecheck": "tsc -p .",
+    "build": "sam build",
+    "deploy": "./scripts/deploy.sh",
+    "oura-auth": "node --env-file-if-exists=deploy.env scripts/oura-auth.mjs",
+    "url": "./scripts/url.sh",
+    "smoke": "./scripts/smoke.sh",
+    "ingest-url": "./scripts/url.sh ingest",
+    "health-smoke": "./scripts/health-smoke.sh"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "type": "module",
+  "private": "true",
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.1141.0",
+    "@aws-sdk/client-ssm": "^3.1141.0",
+    "@modelcontextprotocol/server": "^2.1.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "^2.1.0",
+    "@types/aws-lambda": "^8.10.163",
+    "@types/node": "^26.6.3",
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
