@@ -5,7 +5,12 @@ import type { HealthStore } from './health-store.ts';
 import { syncHaeRows, type SyncResult } from './sync.ts';
 import { parseHaeWorkouts, WORKOUT, type WorkoutRow } from './workouts.ts';
 
-export const MAX_INGEST_BYTES = 1024 * 1024;
+// The most AWS lets through: Lambda's 6 MB (6,291,456-byte) limit on a synchronous request payload,
+// which a Function URL inherits. AWS measures the request as Lambda receives it (the body with
+// every double quote escaped, plus about 1 KB of wrapper), so it answers 413 itself for a Health
+// Auto Export body above roughly 5.5 MB, before this code runs. The same number bounds a gzip body
+// after inflating.
+export const MAX_INGEST_BYTES = 6 * 1024 * 1024;
 
 // Non-sensitive headers Health Auto Export adds; logged with the first payload.
 const HAE_HEADERS = ['content-type', 'user-agent', 'automation-name', 'automation-id', 'automation-aggregation', 'automation-period'];
@@ -30,6 +35,16 @@ export async function handleIngest(
   const started = Date.now();
   if (event.requestContext.http.method !== 'POST') return json(405, { error: 'Use POST.' });
 
+  const tooLarge = (bytes?: number, detail?: string): LambdaFunctionURLResult => {
+    deps.log('hae ingest rejected: too large', { bytes, limit: MAX_INGEST_BYTES, period: event.headers?.['automation-period'] });
+    return json(413, {
+      error: detail ?? `Payload is ${bytes} bytes; the limit is ${MAX_INGEST_BYTES} (6 MB).`,
+      hint:
+        'Select fewer health metrics (only the ones this server stores are needed) or export fewer days per sync. ' +
+        'For a Workouts automation, leave route data out and group workout metrics by minutes, not seconds. Keep ' +
+        '"Batch Requests" off: reconciliation needs each push to be the complete window.',
+    });
+  };
   const declared = Number(event.headers?.['content-length']);
   if (declared > MAX_INGEST_BYTES) return tooLarge(declared);
   let raw = event.body === undefined ? Buffer.alloc(0) : Buffer.from(event.body, event.isBase64Encoded ? 'base64' : 'utf8');
@@ -38,7 +53,7 @@ export async function handleIngest(
     try {
       raw = gunzipSync(raw, { maxOutputLength: MAX_INGEST_BYTES });
     } catch {
-      return tooLarge(undefined, 'Body is not valid gzip, or it inflates past 1 MB.');
+      return tooLarge(undefined, 'Body is not valid gzip, or it inflates past 6 MB.');
     }
   }
   const contentType = event.headers?.['content-type'] ?? '';
@@ -165,13 +180,4 @@ export async function handleIngest(
     ms: Date.now() - started,
   });
   return json(200, summary);
-}
-
-function tooLarge(bytes?: number, detail?: string): LambdaFunctionURLResult {
-  return json(413, {
-    error: detail ?? `Payload is ${bytes} bytes; the limit is ${MAX_INGEST_BYTES} (1 MB).`,
-    hint:
-      'Export fewer days per sync. For a Workouts automation, leave route data out and group workout metrics by ' +
-      'minutes, not seconds. Keep "Batch Requests" off: reconciliation needs each push to be the complete window.',
-  });
 }

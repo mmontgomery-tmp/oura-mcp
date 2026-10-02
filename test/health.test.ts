@@ -3,6 +3,7 @@ import { gzipSync } from 'node:zlib';
 import { test } from 'node:test';
 import { parseHaePayload, redactPayload } from '../src/hae.ts';
 import { dedupeReadings, type HealthRow } from '../src/health.ts';
+import { MAX_INGEST_BYTES } from '../src/ingest.ts';
 import { rows, setup } from './harness.ts';
 
 const TZ = 'America/Los_Angeles';
@@ -111,18 +112,36 @@ test('duplicates: same metric, within 15 min and 5%, keep the claude-log row, pa
 // Ingest endpoint
 
 test('ingest: auth, size limit, content checks, and counts', async () => {
-  const { ingest, health } = setup();
+  const { ingest, health, logs } = setup();
   assert.equal((await ingest(HAE_PAYLOAD, { secret: 'wrong' })).status, 404);
   assert.equal((await ingest(HAE_PAYLOAD, { key: null })).status, 401);
   assert.equal((await ingest(HAE_PAYLOAD, { key: 'wrong' })).status, 401);
   assert.equal((await ingest('{not json')).status, 400);
   assert.equal((await ingest({ hello: 'world' })).status, 400);
   assert.equal((await ingest('a,b\n1,2', { headers: { 'content-type': 'text/csv' } })).status, 415);
-  const big = { data: { metrics: [{ name: 'protein', units: 'g', data: [{ date: '2026-09-26 12:00:00 -0700', qty: 1, source: 'x'.repeat(1024 * 1024) }] }] } };
-  const tooBig = await ingest(big);
+  // The limit is Lambda's 6 MB request payload limit (6 * 1024 * 1024 bytes), to the byte.
+  assert.equal(MAX_INGEST_BYTES, 6_291_456);
+  const padded = (bytes: number) => {
+    const body = { data: { metrics: [{ name: 'protein', units: 'g', data: [{ date: '2026-09-26 12:00:00 -0700', qty: 1, source: 'Food App' }] }], pad: '' } };
+    body.data.pad = 'x'.repeat(bytes - JSON.stringify(body).length);
+    return JSON.stringify(body);
+  };
+  const tooBig = await ingest(padded(MAX_INGEST_BYTES + 1));
   assert.equal(tooBig.status, 413);
-  assert.match(((await tooBig.json()) as { hint: string }).hint, /Batch Requests/);
+  const refusal = (await tooBig.json()) as { error: string; hint: string };
+  assert.match(refusal.error, /6291457 bytes; the limit is 6291456 \(6 MB\)/);
+  assert.match(refusal.hint, /Batch Requests/);
   assert.equal(health.rows.size, 0, 'nothing written by rejected requests');
+  assert.deepEqual(logs.find((l) => l.msg === 'hae ingest rejected: too large'), {
+    msg: 'hae ingest rejected: too large', bytes: MAX_INGEST_BYTES + 1, limit: MAX_INGEST_BYTES, period: undefined,
+  });
+  // Exactly at the limit, and anything that used to be refused above 1 MB, is accepted.
+  for (const bytes of [MAX_INGEST_BYTES, 3 * 1024 * 1024]) {
+    const res = await ingest(padded(bytes));
+    assert.equal(res.status, 200, `${bytes} bytes`);
+  }
+  assert.equal(health.rows.size, 1, 'the one sample, stored once');
+  health.rows.clear();
 
   const ok = await ingest(HAE_PAYLOAD);
   assert.equal(ok.status, 200);
@@ -161,9 +180,14 @@ test('ingest: gzip bodies are inflated (and a gzip bomb is refused)', async () =
   assert.equal(gz.status, 200);
   assert.equal(((await gz.json()) as { rows_written: number }).rows_written, 7);
   assert.equal(health.rows.size, 7);
-  const bomb = gzipSync(JSON.stringify({ data: { metrics: [], pad: 'x'.repeat(3 * 1024 * 1024) } }));
-  assert.ok(bomb.length < 1024 * 1024, 'compressed size is under the limit');
-  assert.equal((await ingest(bomb, { headers: { 'content-encoding': 'gzip' } })).status, 413);
+  // The 6 MB limit also applies after inflating: 5 MB is fine, 7 MB is refused.
+  const inflatesTo = (mb: number) => gzipSync(JSON.stringify({ data: { metrics: [], pad: 'x'.repeat(mb * 1024 * 1024) } }));
+  assert.equal((await ingest(inflatesTo(5), { headers: { 'content-encoding': 'gzip' } })).status, 200);
+  const bomb = inflatesTo(7);
+  assert.ok(bomb.length < 64 * 1024, 'compressed size is far under the limit');
+  const refused = await ingest(bomb, { headers: { 'content-encoding': 'gzip' } });
+  assert.equal(refused.status, 413);
+  assert.match(((await refused.json()) as { error: string }).error, /inflates past 6 MB/);
 });
 
 test('ingest: the first payload is logged once, redacted, and never the secrets', async () => {

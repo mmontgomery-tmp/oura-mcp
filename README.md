@@ -10,7 +10,7 @@ Health readings from both paths, and workouts, share one DynamoDB table.
 claude.ai ──POST /mcp/<path-secret>──────┐      Health Auto Export (iPhone)
                                          │        │ POST /ingest/<ingest-path-secret>
                                          ▼        ▼   + header X-Ingest-Key
-                  Lambda (Node 24, arm64, 256 MB, reserved concurrency 5)
+                  Lambda (Node 24, arm64, 512 MB, reserved concurrency 5)
                   @modelcontextprotocol/server v2, stateless Streamable HTTP
                      │                    │                          │
       SSM Parameter Store (SecureString)  │ api.ouraring.com         DynamoDB (on-demand)
@@ -171,7 +171,11 @@ On-demand DynamoDB, `PK = metric`, `SK = ts`. It's named in the stack output `He
   - Re-sends land on the same row (keyed by the workout's `id`), so a workout whose numbers change is updated in place.
   - Reconciliation follows the same rules as other samples, except that the more-than-half guard looks at the whole window instead of each day. A day usually holds one workout, so a per-day guard could never retire a deleted one.
   - The reply adds a `workouts` object with its own counts.
-- **Size limit:** bodies over 1 MB are rejected with a 413, also after gzip decompression.
+- **Size limit:** 6 MB (6,291,456 bytes), the most AWS allows: it's Lambda's limit on a synchronous request payload. A gzip body may inflate to the same 6 MB.
+  - AWS measures the request as Lambda receives it: the body with every double quote escaped, plus about 1 KB of wrapper. So for Health Auto Export JSON the real ceiling is about **5.5 MB per push**.
+  - Above that, AWS itself answers 413 (`... byte payload is too large for the RequestResponse invocation type`) and the function never runs, so nothing appears in its logs.
+  - A 413 from the function's own check is logged as `hae ingest rejected: too large`.
+  - What to do about a push that is too large is in [docs/RUNBOOK.md](docs/RUNBOOK.md#payload-size).
 - **Response:** HTTP 200 with the counts, e.g. `{"accepted":4,"skipped":1,"skipped_reasons":{"oura_source":1},"rows_written":1,"rows_unchanged":3}`. `ignored_metrics` lists any unsupported metric names that were sent. The log line also records how many samples each metric carried and the automation's period.
 - **First payload:** the first Health Metrics payload and the first Workouts payload are each logged once, redacted (every number becomes `"<number>"`; only 2 samples per metric or workout series and 3 workouts are kept). Find them in CloudWatch with `sam logs --stack-name oura-mcp --filter 'hae first payload'` and `--filter 'hae first workout payload'`. To log another one, delete the bookkeeping row: `aws dynamodb delete-item --table-name <HealthTableName> --key '{"metric":{"S":"_meta"},"ts":{"S":"hae-first-payload-logged"}}'`.
 

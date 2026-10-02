@@ -60,7 +60,9 @@ Resources:
       Runtime: nodejs24.x
       Architectures: [arm64]
       Handler: handler.handler
-      MemorySize: 256
+      # 512 MB: a maximum-size ingest payload (6 MB, every sample accepted) peaks about 110 MB above
+      # the function's 125-165 MB baseline, which does not fit in 256 MB. See docs/RUNBOOK.md.
+      MemorySize: 512
       Timeout: 30
       ReservedConcurrentExecutions: !If [HasReservedConcurrency, !Ref ReservedConcurrency, !Ref AWS::NoValue]
       LoggingConfig:

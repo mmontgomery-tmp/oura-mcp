@@ -13,7 +13,7 @@ npm ci                          # after a fresh clone
 | Piece | Where |
 |---|---|
 | Code, template, docs | this repo |
-| Lambda + Function URL | CloudFormation stack `oura-mcp` (us-east-1). Runtime `nodejs24.x`, reserved concurrency 5 (see [Concurrency](#concurrency)) |
+| Lambda + Function URL | CloudFormation stack `oura-mcp` (us-east-1). Runtime `nodejs24.x`, 512 MB, reserved concurrency 5 (see [Concurrency](#concurrency)) |
 | Health readings and workouts | DynamoDB table in stack output `HealthTableName`. Retained if the stack is deleted |
 | Secrets | SSM Parameter Store, SecureString, under `/oura-mcp/`: `path-secret`, `ingest-path-secret`, `ingest-key`, `oauth-client`, `tokens`. Never in the repo |
 | Settings | `deploy.env` (git-ignored; copy `deploy.env.example`): region, stack name, timezone, reserved concurrency, budget amount and email |
@@ -149,7 +149,7 @@ Both use these settings:
 | Summarize Data | Off. It would average individual readings; the server adds up nutrition itself |
 | Date Range | Previous 7 Days, or Today for the second automation |
 | Sync cadence | every 5 minutes |
-| Batch Requests | **Off.** One request per push, so a push is the complete window. A 7-day push is about 15 KB; the limit is 1 MB |
+| Batch Requests | **Off.** One request per push, so a push is the complete window. A 7-day push of the metrics above is about 30 KB; the limit is about 5.5 MB (see [Payload size](#payload-size)) |
 
 **Workouts.** Two more automations, again identical except for the name and Date Range ("Previous 7 Days" and "Today"), with the same URL and `X-Ingest-Key` header:
 
@@ -159,12 +159,24 @@ Both use these settings:
 | Data Type | **Workouts** |
 | Export Format / Version | JSON / Version 2 |
 | Include Route Data | Off. Routes aren't used and make the payload large |
-| Include Workout Metrics | On, with Time Grouping (Workout Metrics) set to **Minutes**. The per-minute series are where the recording app's name comes from; grouping by seconds can push a week of workouts past the 1 MB limit |
+| Include Workout Metrics | On, with Time Grouping (Workout Metrics) set to **Minutes**. The per-minute series are where the recording app's name comes from; grouping by seconds can push a week of workouts past the size limit (see [Payload size](#payload-size)) |
 | Date Range | Previous 7 Days, or Today for the second automation |
 | Sync cadence | every 5 minutes |
 | Batch Requests | **Off** |
 
 What the server reads from a workout, and how it picks `source`, is in the README under *Apple Health ingest → Workouts*. After the first Workouts push, check the `hae ingest` log line: `workout_fields` lists the fields the payload really carried, and the first payload is logged once, redacted, as `hae first workout payload`.
+
+### Payload size
+
+A push can be at most **6 MB (6,291,456 bytes)**: Lambda's limit on a synchronous request payload, which is the most AWS allows. A gzip body may inflate to the same 6 MB.
+
+- **The real ceiling is about 5.5 MB of Health Auto Export JSON.** AWS measures the request as Lambda receives it: the body with every double quote escaped, plus about 1 KB of wrapper. Measured on this stack on 2026-10-02: a 5.4 MB body passed and a 5.7 MB body was refused.
+- **Selecting every health metric doesn't fit in a 7-day push.** With Summarize Data off, step count, heart rate, active energy and walking distance arrive as thousands of samples a day. On 2026-10-02 a "Today" push with every metric was 0.9 MB by mid-morning, so a full day is roughly 2 MB and "Previous 7 Days" roughly 14 MB. The server ignores all of them anyway. Select only the metrics in the Data Type row above.
+- **How a refused push shows up:**
+  - Refused by AWS (over the ceiling): the function never runs, so its logs show nothing. Health Auto Export reports the upload as failed (HTTP 413), and the function's `Url4xxCount` metric counts it.
+  - Refused by the function (a gzip body that inflates past 6 MB): a log line `hae ingest rejected: too large`, with the size.
+- **Memory:** the function has 512 MB. A maximum-size push in which every sample is accepted peaks about 110 MB above the function's 125–165 MB baseline; a push of mostly ignored metrics adds about 40 MB. `REPORT` log lines show `Max Memory Used`.
+- **Don't turn on Batch Requests to get under the limit.** Reconciliation needs each push to be the complete window.
 
 **Why re-sending 7 days every 5 minutes is safe:**
 - Each sample is stored under its time plus a fingerprint of its source app, values and unit, so a re-sent sample lands on the same row.

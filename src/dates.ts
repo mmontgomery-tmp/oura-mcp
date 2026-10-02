@@ -81,14 +81,27 @@ export class TimestampError extends Error {
 const TIMESTAMP_RE =
   /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?\s*(Z|[+-]\d{2}:?\d{2})?$/i;
 
-/** Milliseconds to add to UTC to get wall-clock time in `timeZone` at `instant`. */
-export function tzOffsetMs(instant: number, timeZone: string): number {
-  const parts = Object.fromEntries(
-    new Intl.DateTimeFormat('en-US', {
+// One formatter per timezone, kept for the life of the instance. An Intl.DateTimeFormat is a large
+// native object: building one for every sample of a big Health Auto Export push cost about 45 KB
+// each until garbage collection caught up, hundreds of MB for a few thousand samples.
+const wallClockFormatters = new Map<string, Intl.DateTimeFormat>();
+function wallClockFormatter(timeZone: string): Intl.DateTimeFormat {
+  let fmt = wallClockFormatters.get(timeZone);
+  if (!fmt) {
+    fmt = new Intl.DateTimeFormat('en-US', {
       timeZone,
       hourCycle: 'h23',
       year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit',
-    })
+    });
+    wallClockFormatters.set(timeZone, fmt);
+  }
+  return fmt;
+}
+
+/** Milliseconds to add to UTC to get wall-clock time in `timeZone` at `instant`. */
+export function tzOffsetMs(instant: number, timeZone: string): number {
+  const parts = Object.fromEntries(
+    wallClockFormatter(timeZone)
       .formatToParts(new Date(instant))
       .map((p) => [p.type, p.value]),
   );
