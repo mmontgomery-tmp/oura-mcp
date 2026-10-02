@@ -13,18 +13,18 @@ npm ci                          # after a fresh clone
 | Piece | Where |
 |---|---|
 | Code, template, docs | this repo |
-| Lambda + Function URL | CloudFormation stack `oura-mcp` (us-east-1). Runtime `nodejs24.x`, reserved concurrency 2 |
-| Health readings | DynamoDB table in stack output `HealthTableName`. Retained if the stack is deleted |
+| Lambda + Function URL | CloudFormation stack `oura-mcp` (us-east-1). Runtime `nodejs24.x`, reserved concurrency 5 (see [Concurrency](#concurrency)) |
+| Health readings and workouts | DynamoDB table in stack output `HealthTableName`. Retained if the stack is deleted |
 | Secrets | SSM Parameter Store, SecureString, under `/oura-mcp/`: `path-secret`, `ingest-path-secret`, `ingest-key`, `oauth-client`, `tokens`. Never in the repo |
 | Settings | `deploy.env` (git-ignored; copy `deploy.env.example`): region, stack name, timezone, reserved concurrency, budget amount and email |
 | Budget alert | AWS Budgets, `oura-mcp-monthly-cost` (see [Budget](#budget-alert)) |
 | claude.ai connector | claude.ai → Settings → Connectors, URL from `npm run url` |
-| Apple Health sync | Health Auto Export on the iPhone, automation "Claude MCP": URL and header from `npm run ingest-url`, settings in [Health Auto Export settings](#health-auto-export-settings) |
+| Apple Health sync | Health Auto Export on the iPhone, four automations (health metrics and workouts, each for "Previous 7 Days" and "Today"): URL and header from `npm run ingest-url`, settings in [Health Auto Export settings](#health-auto-export-settings) |
 
 ## Health checks
 
 ```bash
-npm test               # offline: 86 tests
+npm test               # offline: 100 tests
 npm run smoke          # live: MCP endpoint + one Oura tool
 npm run health-smoke   # live: ingest, log/delete, duplicates. Writes test rows dated 2001-02-03 to the PRODUCTION table and deletes them afterwards; skip it when test data must stay out of production
 sam logs --stack-name oura-mcp --region us-east-1 --tail
@@ -34,7 +34,7 @@ sam logs --stack-name oura-mcp --region us-east-1 --tail
 
 In the logs, look for:
 - `tool error` lines: tool failures, with their message
-- `hae ingest` lines: accepted and skipped counts for each Health Auto Export sync
+- `hae ingest` lines: accepted and skipped counts for each Health Auto Export sync. A Workouts push adds `workouts` (its counts), `workout_types` and `workout_fields`
 - `rejected:` lines: failed auth, with the reason (secrets are never logged)
 
 ## Redeploy
@@ -48,6 +48,18 @@ A deploy doesn't take the connector offline: Lambda switches to the new code bet
 **Roll back:** `git switch --detach <last good commit> && npm ci && npm run deploy && git switch main && npm ci`.
 
 **Runtime:** Node.js 24 stays supported until April 2028. When AWS announces a newer Node runtime, change `Runtime:` and `Target:` in `template.yaml`, then run `npm test` and `npm run deploy`.
+
+## Concurrency
+
+The function has **reserved concurrency 5** (`RESERVED_CONCURRENCY` in `deploy.env`; the template's default). That's the most requests it serves at once; one more gets `ReservedFunctionConcurrentInvocationLimitExceeded` (HTTP 429).
+- **Why 5:** a chat can make three tool calls at once, and the Health Auto Export automations push every 5 minutes, usually together. At 2, three parallel tool calls always lost one.
+- **What it protects:** it caps how much the function can run, and so what it can cost, if the URL is ever hammered. It doesn't cost anything itself.
+- **If it still happens:** a throttled Health Auto Export push is simply sent again on the next sync. If chats hit the limit, raise the number in `deploy.env` and run `npm run deploy`. The account must keep 10 unreserved, so the value can go up to the account's Lambda concurrency quota minus 10.
+- **Check for throttles:** CloudWatch → Lambda metrics → `Throttles` for the function, or:
+  ```bash
+  aws cloudwatch get-metric-statistics --namespace AWS/Lambda --metric-name Throttles --statistics Sum --period 3600 \
+    --dimensions Name=FunctionName,Value=<FunctionName> --start-time <ISO time> --end-time <ISO time>
+  ```
 
 ## Re-authorize Oura
 
@@ -119,7 +131,9 @@ It shows the earliest and latest restorable times, covering up to the last 35 da
 
 ## Health Auto Export settings
 
-Two automations in Health Auto Export on the iPhone, identical except for the name and Date Range:
+Four automations in Health Auto Export on the iPhone: two for health metrics and two for workouts. All four use the same URL and header.
+
+**Health metrics.** Two automations, identical except for the name and Date Range:
 - **"Claude MCP":** Date Range "Previous 7 Days". That's the 7 days *before* today and never includes today (confirmed from production pushes on 2026-09-29). It does the backfill and reconciles the six full days inside its window.
 - **"Claude MCP Today":** Date Range "Today". Today's entries arrive the same day. "Today" pushes are idempotent and reconcile today's rows, so an entry edited or deleted today is retired the same day.
 
@@ -130,12 +144,27 @@ Both use these settings:
 | Type | REST API |
 | URL | the `URL:` line from `npm run ingest-url` |
 | Headers | `X-Ingest-Key` = the value on the `Header:` line |
-| Data Type | Health Metrics: Weight, Blood Pressure, Blood Glucose, Protein, Carbohydrates, **Fiber**, Total Fat, Dietary Energy. Fiber is required: net carbs from 2026-09-29 15:44 PT on are carbs − fiber (see the README's *Net carbs*). Saturated Fat is ignored if selected |
+| Data Type | Health Metrics: Weight, Waist Circumference, Body Fat Percentage, Lean Body Mass, Blood Pressure, Blood Glucose, Protein, Carbohydrates, **Fiber**, Total Fat, Dietary Energy. Fiber is required: net carbs from 2026-09-29 15:44 PT on are carbs − fiber (see the README's *Net carbs*). Saturated Fat is ignored if selected. Select only metrics that have data in Apple Health |
 | Export Format / Version | JSON / Version 2 |
 | Summarize Data | Off. It would average individual readings; the server adds up nutrition itself |
 | Date Range | Previous 7 Days, or Today for the second automation |
 | Sync cadence | every 5 minutes |
 | Batch Requests | **Off.** One request per push, so a push is the complete window. A 7-day push is about 15 KB; the limit is 1 MB |
+
+**Workouts.** Two more automations, again identical except for the name and Date Range ("Previous 7 Days" and "Today"), with the same URL and `X-Ingest-Key` header:
+
+| Setting | Value |
+|---|---|
+| Type | REST API |
+| Data Type | **Workouts** |
+| Export Format / Version | JSON / Version 2 |
+| Include Route Data | Off. Routes aren't used and make the payload large |
+| Include Workout Metrics | On, with Time Grouping (Workout Metrics) set to **Minutes**. The per-minute series are where the recording app's name comes from; grouping by seconds can push a week of workouts past the 1 MB limit |
+| Date Range | Previous 7 Days, or Today for the second automation |
+| Sync cadence | every 5 minutes |
+| Batch Requests | **Off** |
+
+What the server reads from a workout, and how it picks `source`, is in the README under *Apple Health ingest → Workouts*. After the first Workouts push, check the `hae ingest` log line: `workout_fields` lists the fields the payload really carried, and the first payload is logged once, redacted, as `hae first workout payload`.
 
 **Why re-sending 7 days every 5 minutes is safe:**
 - Each sample is stored under its time plus a fingerprint of its source app, values and unit, so a re-sent sample lands on the same row.
@@ -160,6 +189,7 @@ Reconciliation only runs when a push is known to be complete:
 - **Only** for metrics with at least one accepted sample in that push. A metric missing or empty because a HealthKit query failed (for example error 6 while the phone is locked) is left alone.
 - **"Previous 7 Days":** only for the six full days strictly inside the window. The oldest day may be partial, and today isn't in it.
 - **"Today":** only for today's rows, and only while the phone is in the server's time zone (`USER_TZ`). In another time zone the phone's "today" starts at a different midnight, so the push would look partial; it's stored but not reconciled, and the log line carries `reconcile_note`. The next "Previous 7 Days" push picks the day up.
+- **Workouts** follow the same rules, but the more-than-half check below covers the whole window (the six days, or today) instead of each day. A day usually holds one workout, so a per-day check could never retire a deleted one. A push with no workouts at all is never reconciled, so deleting the only workout in the window isn't picked up until another workout is in it.
 - **Not** for a metric-day where more than half its samples would be newly marked in one push. That's logged as `hae reconcile skipped`. Rows an earlier push already marked `missing_since` aren't counted, so several rounds of edits to the same day don't add up to "more than half". A consequence: deleting *all* of a day's entries isn't picked up automatically. That includes a weekly weigh-in or BP reading deleted with no replacement (a correction *is* picked up: the old and new sample make 1 of 2, not more than half). Remove those with `delete_reading` (below).
 
 Each `hae ingest` log line shows `rows_written`, `rows_unchanged`, `marked_missing`, `superseded` and `restored`. It also shows how many samples each metric carried (`metrics`) and which sample fields arrived (`sample_fields`), so partial locked-phone pushes, or a sample ID HAE might add later, would show up. **Review these after a week of 5-minute pushes** before deciding whether superseded rows older than 30 days can be hard-deleted.

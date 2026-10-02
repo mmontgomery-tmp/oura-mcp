@@ -4,6 +4,7 @@ import { addDays, DATE_RE, type DateRange, daysBetween, localDateFormatter, loca
 import { NET_CARBS_SWITCHOVER_MS } from './health.ts';
 import type { HealthStore } from './health-store.ts';
 import { registerHealthTools } from './health-tools.ts';
+import { registerWorkoutTools } from './workout-tools.ts';
 import { type OuraApi, OuraApiError } from './oura.ts';
 import { registerRangePrompt } from './prompts.ts';
 import {
@@ -51,10 +52,11 @@ const READ_ONLY = { readOnlyHint: true, destructiveHint: false, idempotentHint: 
 function instructions(timeZone: string): string {
   const t = localTime(NET_CARBS_SWITCHOVER_MS, timeZone);
   return `One person's health data. Oura Ring (read-only): get_sleep, get_heart_rate, get_readiness,
-get_activity. Apple Health and chat readings: get_health_metrics for weight, blood pressure, glucose, ketones, protein,
-net carbs (carbs_g), fiber, fat and calories. carbs_g is always net carbs: entries before ${t.date} ${t.time}
+get_activity. Apple Health and chat readings: get_health_metrics for weight, waist (in), body_fat (%), lean_mass (lb),
+blood pressure, glucose, ketones, protein, net carbs (carbs_g), fiber, fat and calories. Workouts recorded in Apple Health
+(for example Peloton rides): get_workouts, one row per workout plus daily totals. carbs_g is always net carbs: entries before ${t.date} ${t.time}
 (${timeZone}) were entered as net carbs; from then on net carbs = total carbs minus matching fiber (total_carbs_g and
-fiber_g show the parts). Entries edited or deleted in Apple Health, today's included, are corrected automatically
+fiber_g show the parts). Entries and workouts edited or deleted in Apple Health, today's included, are corrected automatically
 once two phone syncs at least 15 minutes apart agree; until then an edited entry can be counted twice. Whenever the
 person reports a home glucose or ketone reading, save it with log_reading (and
 delete_reading undoes one). Date-range tools take an optional inclusive start_date/end_date (YYYY-MM-DD) and return
@@ -68,6 +70,7 @@ export function buildServer(deps: ToolDeps): McpServer {
   const log = deps.log ?? ((msg, extra) => console.log(JSON.stringify({ msg, ...extra })));
   const server = new McpServer({ name: 'oura', version: SERVER_VERSION }, { instructions: instructions(timeZone) });
   registerHealthTools(server, { health: deps.health, timeZone, now: deps.now, log });
+  registerWorkoutTools(server, { health: deps.health, timeZone, now: deps.now, log });
 
   const sleepPeriods = (range: DateRange) => oura.list<SleepPeriod>('sleep', paddedDateParams(range), SLEEP_FIELDS);
 

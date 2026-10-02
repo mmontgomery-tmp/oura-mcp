@@ -2,7 +2,8 @@ import { gunzipSync } from 'node:zlib';
 import type { LambdaFunctionURLEvent, LambdaFunctionURLResult } from 'aws-lambda';
 import { HaeFormatError, parseHaePayload, redactPayload } from './hae.ts';
 import type { HealthStore } from './health-store.ts';
-import { syncHaeRows } from './sync.ts';
+import { syncHaeRows, type SyncResult } from './sync.ts';
+import { parseHaeWorkouts, WORKOUT, type WorkoutRow } from './workouts.ts';
 
 export const MAX_INGEST_BYTES = 1024 * 1024;
 
@@ -77,11 +78,19 @@ export async function handleIngest(
     throw err;
   }
 
-  // One redacted payload, once per table, so the real schema can be checked in CloudWatch.
+  // A "Workouts" automation sends data.workouts instead of data.metrics (see workouts.ts).
+  const workouts = parseHaeWorkouts(body, { timeZone: deps.timeZone, now });
+  const hasMetrics = Array.isArray((body as { data?: { metrics?: unknown } }).data?.metrics);
+
+  // One redacted payload of each kind, once per table, so the real schema can be checked in
+  // CloudWatch.
   try {
-    if (await deps.health.claimFirstPayloadLog()) {
-      const headers = Object.fromEntries(HAE_HEADERS.flatMap((h) => (event.headers?.[h] ? [[h, event.headers[h]]] : [])));
+    const headers = Object.fromEntries(HAE_HEADERS.flatMap((h) => (event.headers?.[h] ? [[h, event.headers[h]]] : [])));
+    if ((hasMetrics || !workouts) && (await deps.health.claimFirstPayloadLog('metrics'))) {
       deps.log('hae first payload (redacted)', { bytes: raw.length, headers, payload: redactPayload(body) });
+    }
+    if (workouts?.received && (await deps.health.claimFirstPayloadLog('workouts'))) {
+      deps.log('hae first workout payload (redacted)', { bytes: raw.length, headers, payload: redactPayload(body) });
     }
   } catch (err) {
     deps.log('hae first payload log failed', { error: err instanceof Error ? err.message : String(err) });
@@ -96,24 +105,48 @@ export async function handleIngest(
     period,
     acceptedByMetric: parsed.accepted_by_metric,
   });
+  // Workouts follow the same rules, with the more-than-half guard over the whole window.
+  let workoutSync: SyncResult | undefined;
+  if (workouts) {
+    workoutSync = await syncHaeRows<WorkoutRow>(
+      { query: (_metric, from, to) => deps.health.queryWorkouts(from, to), writeRows: (rows) => deps.health.writeRows(rows) },
+      workouts.rows,
+      { now, timeZone: deps.timeZone, period, acceptedByMetric: { [WORKOUT]: workouts.accepted }, guard: 'window' },
+    );
+  }
+  const counts = (s: SyncResult) => ({
+    rows_written: s.written,
+    rows_unchanged: s.unchanged,
+    reconcile: s.reconcile,
+    ...(s.note ? { reconcile_note: s.note } : {}),
+    marked_missing: s.pending,
+    superseded: s.superseded,
+    restored: s.restored,
+    ...(s.skipped_days.length ? { reconcile_skipped: s.skipped_days } : {}),
+  });
   const summary = {
     accepted: parsed.accepted,
     skipped: parsed.skipped,
     skipped_reasons: parsed.skipped_reasons,
-    rows_written: sync.written,
-    rows_unchanged: sync.unchanged,
-    reconcile: sync.reconcile,
-    ...(sync.note ? { reconcile_note: sync.note } : {}),
-    marked_missing: sync.pending,
-    superseded: sync.superseded,
-    restored: sync.restored,
-    ...(sync.skipped_days.length ? { reconcile_skipped: sync.skipped_days } : {}),
+    ...counts(sync),
     ...(parsed.ignored_metrics.length ? { ignored_metrics: parsed.ignored_metrics } : {}),
+    // Health Metrics payloads can carry an empty "workouts" list; only report real workout pushes.
+    ...(workouts && workoutSync && (workouts.received > 0 || !hasMetrics)
+      ? {
+          workouts: {
+            received: workouts.received,
+            accepted: workouts.accepted,
+            skipped: workouts.skipped,
+            skipped_reasons: workouts.skipped_reasons,
+            ...counts(workoutSync),
+          },
+        }
+      : {}),
   };
   // A skipped metric-day recurs on every push (every 5 minutes) until fixed by hand: log it only
   // on the first push of each clock hour.
   const hour = now.toISOString().slice(0, 13);
-  for (const d of sync.skipped_days) {
+  for (const d of [...sync.skipped_days, ...(workoutSync?.skipped_days ?? [])]) {
     if (await deps.health.claimHourlyLog(`reconcile-skip#${d.metric}#${d.day}`, hour)) {
       deps.log('hae reconcile skipped: more than half of a metric-day would be marked', { ...d });
     }
@@ -125,6 +158,7 @@ export async function handleIngest(
     metrics: parsed.metric_counts,
     units: parsed.metric_units,
     sample_fields: parsed.sample_fields,
+    ...(workouts?.received ? { workout_types: workouts.types, workout_fields: workouts.fields } : {}),
     period,
     ...(testNow !== undefined ? { test_now: now.toISOString() } : {}),
     bytes: raw.length,
@@ -136,6 +170,8 @@ export async function handleIngest(
 function tooLarge(bytes?: number, detail?: string): LambdaFunctionURLResult {
   return json(413, {
     error: detail ?? `Payload is ${bytes} bytes; the limit is ${MAX_INGEST_BYTES} (1 MB).`,
-    hint: 'Turn on "Batch Requests" in the automation, or export fewer days per sync.',
+    hint:
+      'Export fewer days per sync. For a Workouts automation, leave route data out and group workout metrics by ' +
+      'minutes, not seconds. Keep "Batch Requests" off: reconciliation needs each push to be the complete window.',
   });
 }

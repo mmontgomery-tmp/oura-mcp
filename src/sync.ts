@@ -1,6 +1,5 @@
 import { addDays, localDateFormatter, localTime, parseInstant, sortKey, tzOffsetMs } from './dates.ts';
-import { type HealthRow, type Metric, rowInstant, rowTime } from './health.ts';
-import type { HealthStore } from './health-store.ts';
+import { rowInstant, rowTime } from './health.ts';
 
 // Writes one Health Auto Export push and reconciles it against what is stored.
 //
@@ -24,13 +23,36 @@ import type { HealthStore } from './health-store.ts';
 // - not for a metric-day where more than half the samples would be newly marked in one push
 //   (logged). Rows an earlier push already marked missing are left out of that count, so several
 //   rounds of edits to the same day don't add up to "more than half".
+//
+// Workouts use the same rules with one difference: the more-than-half guard looks at the whole
+// reconciled window instead of each day. A day usually holds one workout, so a per-day guard could
+// never retire a deleted one; and a push that carries any workouts answered the one workouts query
+// in full.
 
 export const RECONCILE_PERIOD = 'Previous 7 Days';
 export const TODAY_PERIOD = 'Today';
 export const CONFIRM_MISSING_MS = 15 * 60_000;
 
+/** What reconciliation needs from a stored row: health readings and workouts both fit. */
+export interface SyncRow {
+  metric: string;
+  ts: string;
+  via: 'hae' | 'chat';
+  /** The timestamp exactly as received, with its original offset. */
+  recorded_at: string;
+  missing_since?: string;
+  superseded_at?: string;
+  superseded_by?: 'reconcile' | 'chat';
+}
+
+export interface SyncStore<R extends SyncRow> {
+  query(metric: R['metric'], from: string, to: string): Promise<R[]>;
+  writeRows(rows: R[]): Promise<void>;
+}
+
 export interface SkippedDay {
-  metric: Metric;
+  metric: string;
+  /** The day, or "first..last" when the guard covers the whole window. */
   day: string;
   missing: number;
   total: number;
@@ -45,7 +67,7 @@ export interface SyncResult {
   pending: number;
   /** Newly marked superseded_at (second miss, at least 15 minutes after the first). */
   superseded: number;
-  reconciled: Metric[];
+  reconciled: string[];
   reconcile: 'on' | 'off';
   /** Why a "Today" push was not reconciled, when that is not the usual reason. */
   note?: string;
@@ -53,7 +75,7 @@ export interface SyncResult {
 }
 
 /** What makes two versions of a row "the same": every attribute except ingested_at. */
-export function rowFingerprint(row: HealthRow): string {
+export function rowFingerprint(row: SyncRow): string {
   const item = row as unknown as Record<string, unknown>;
   return JSON.stringify(
     Object.keys(item)
@@ -63,14 +85,21 @@ export function rowFingerprint(row: HealthRow): string {
   );
 }
 
-export async function syncHaeRows(
-  store: HealthStore,
-  rows: HealthRow[],
-  opts: { now: Date; timeZone: string; period?: string; acceptedByMetric: Partial<Record<Metric, number>> },
+export async function syncHaeRows<R extends SyncRow>(
+  store: SyncStore<R>,
+  rows: R[],
+  opts: {
+    now: Date;
+    timeZone: string;
+    period?: string;
+    acceptedByMetric: Partial<Record<string, number>>;
+    /** What the more-than-half guard measures: each day (readings) or the whole window (workouts). */
+    guard?: 'day' | 'window';
+  },
 ): Promise<SyncResult> {
   const { now, timeZone } = opts;
   const nowIso = now.toISOString();
-  const localDay = (r: HealthRow) => localTime(rowTime(r), timeZone).date;
+  const localDay = (r: SyncRow) => localTime(rowTime(r), timeZone).date;
   const period = (opts.period ?? '').trim().toLowerCase();
   const todayPush = period === TODAY_PERIOD.toLowerCase();
   const note = todayPush && !rows.every((r) => inServerTimeZone(r, timeZone)) ? 'phone is in another time zone' : undefined;
@@ -96,14 +125,14 @@ export async function syncHaeRows(
     skipped_days: [],
   };
 
-  const byMetric = new Map<Metric, HealthRow[]>();
+  const byMetric = new Map<R['metric'], R[]>();
   for (const r of rows) {
     let list = byMetric.get(r.metric);
     if (!list) byMetric.set(r.metric, (list = []));
     list.push(r);
   }
 
-  const toWrite: HealthRow[] = [];
+  const toWrite: R[] = [];
   for (const [metric, pushed] of byMetric) {
     const reconcileMetric = reconcile && (opts.acceptedByMetric[metric] ?? 0) > 0;
     const instants = pushed.map(rowInstant).sort();
@@ -129,16 +158,19 @@ export async function syncHaeRows(
     if (!reconcileMetric) continue;
     result.reconciled.push(metric);
     const pushedKeys = new Set(pushed.map((r) => r.ts));
-    for (const day of days) {
-      const active = [...stored.values()].filter((r) => !r.superseded_at && localDay(r) === day);
+    const groups = opts.guard === 'window' ? [days] : days.map((d) => [d]);
+    for (const group of groups) {
+      const inGroup = (r: SyncRow) => group.includes(localDay(r));
+      const active = [...stored.values()].filter((r) => !r.superseded_at && inGroup(r));
       const missing = active.filter((r) => !pushedKeys.has(r.ts));
       if (!missing.length) continue;
       // The guard looks at what this push would newly mark. Rows an earlier push already marked
-      // missing count neither as missing nor towards the day's total.
+      // missing count neither as missing nor towards the total.
       const fresh = missing.filter((r) => !r.missing_since);
       const counted = active.filter((r) => pushedKeys.has(r.ts) || !r.missing_since);
-      const total = new Set([...counted.map((r) => r.ts), ...pushed.filter((r) => localDay(r) === day).map((r) => r.ts)]).size;
+      const total = new Set([...counted.map((r) => r.ts), ...pushed.filter(inGroup).map((r) => r.ts)]).size;
       if (fresh.length > total / 2) {
+        const day = group.length === 1 ? group[0] : `${group[0]}..${group.at(-1)}`;
         result.skipped_days.push({ metric, day, missing: fresh.length, total });
         continue;
       }
@@ -160,7 +192,7 @@ export async function syncHaeRows(
 }
 
 /** True when the sample's own UTC offset (as the phone wrote it) is the server time zone's. */
-function inServerTimeZone(row: HealthRow, timeZone: string): boolean {
+function inServerTimeZone(row: SyncRow, timeZone: string): boolean {
   const m = /([+-])(\d{2}):?(\d{2})$/.exec(row.recorded_at?.trim() ?? '');
   if (!m) return false;
   const offsetMs = (m[1] === '-' ? -1 : 1) * (Number(m[2]) * 60 + Number(m[3])) * 60_000;

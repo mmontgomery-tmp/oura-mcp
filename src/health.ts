@@ -1,12 +1,18 @@
 // Health readings shared by the Apple Health ingest, the log/delete tools and get_health_metrics.
 import { createHash } from 'node:crypto';
 
-export const METRICS = ['weight', 'bp', 'glucose', 'ketones', 'protein', 'carbs', 'fiber', 'fat', 'calories'] as const;
+export const METRICS = ['weight', 'waist', 'body_fat', 'lean_mass', 'bp', 'glucose', 'ketones', 'protein', 'carbs', 'fiber', 'fat', 'calories'] as const;
 export type Metric = (typeof METRICS)[number];
 
 /** Normalized unit per metric. Stored values are always in these units. */
 export const UNITS: Record<Metric, string> = {
   weight: 'lb',
+  /** Apple Health Waist Circumference. */
+  waist: 'in',
+  /** Apple Health Body Fat Percentage, as a percentage (22.5 = 22.5%). */
+  body_fat: '%',
+  /** Apple Health Lean Body Mass. */
+  lean_mass: 'lb',
   bp: 'mmHg',
   glucose: 'mg/dL',
   ketones: 'mmol/L',
@@ -106,8 +112,13 @@ const GLUCOSE_MG_PER_MMOL = 18.016; // molar mass of glucose, 180.16 g/mol
 
 // Accepted input units per metric -> factor to the normalized unit. Keys are lowercased with
 // whitespace removed. Apple Health writes molar glucose as "mmol<180.1558800000541>/L".
+const MASS_TO_LB = { lb: 1, lbs: 1, pound: 1, pounds: 1, kg: 2.20462262185, g: 0.00220462262185, st: 14, stone: 14 };
 const CONVERSIONS: Record<Metric, Record<string, number>> = {
-  weight: { lb: 1, lbs: 1, pound: 1, pounds: 1, kg: 2.20462262185, g: 0.00220462262185, st: 14, stone: 14 },
+  weight: MASS_TO_LB,
+  waist: { in: 1, inch: 1, inches: 1, cm: 1 / 2.54, mm: 1 / 25.4, m: 100 / 2.54, ft: 12 },
+  // A value of 1 or less is a fraction (0.225 = 22.5%); see bodyFatPercent.
+  body_fat: { '%': 1, percent: 1 },
+  lean_mass: MASS_TO_LB,
   bp: { mmhg: 1, kpa: 7.50061683 },
   glucose: { 'mg/dl': 1, 'mmol/l': GLUCOSE_MG_PER_MMOL },
   ketones: { 'mmol/l': 1 },
@@ -117,11 +128,19 @@ const CONVERSIONS: Record<Metric, Record<string, number>> = {
   fat: { g: 1, mg: 0.001 },
   calories: { kcal: 1, cal: 1, kilocalories: 1, kj: 1 / 4.184 },
 };
-const DECIMALS: Record<Metric, number> = { weight: 2, bp: 0, glucose: 1, ketones: 2, protein: 1, carbs: 1, fiber: 1, fat: 1, calories: 1 };
+const DECIMALS: Record<Metric, number> = { weight: 2, waist: 2, body_fat: 1, lean_mass: 2, bp: 0, glucose: 1, ketones: 2, protein: 1, carbs: 1, fiber: 1, fat: 1, calories: 1 };
 
 export function unitFactor(metric: Metric, unit: string): number | undefined {
   const key = unit.toLowerCase().replace(/\s+/g, '').replace(/^mmol<[\d.]+>\//, 'mmol/');
   return CONVERSIONS[metric][key];
+}
+
+/**
+ * Body fat as a percentage. HealthKit stores it as a fraction, and nobody's body fat is 1% or
+ * less, so a value of 1 or below is taken as a fraction whatever the unit label says.
+ */
+export function bodyFatPercent(qty: number): number {
+  return qty > 0 && qty <= 1 ? qty * 100 : qty;
 }
 
 export function roundFor(metric: Metric, value: number): number {

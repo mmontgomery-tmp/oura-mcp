@@ -191,7 +191,8 @@ export function registerHealthTools(server: McpServer, deps: HealthToolDeps): vo
       title: 'Delete or remove a reading',
       description:
         'Remove a reading the user says is wrong. A reading logged in chat (source "claude-log") is deleted. An ' +
-        'Apple Health reading (weight, bp, glucose, protein, carbs, fiber, fat, calories from the phone) is marked removed ' +
+        'Apple Health reading (weight, waist, body_fat, lean_mass, bp, glucose, protein, carbs, fiber, fat, calories ' +
+        'from the phone) is marked removed ' +
         '(superseded): it stops counting in get_health_metrics but stays in the table. It is still in Apple Health, ' +
         'so tell the user to delete it there too, or the next Health Auto Export push restores it. undo: true ' +
         'restores an Apple Health reading marked removed. Identify the reading by metric and timestamp (exact, or ' +
@@ -280,9 +281,10 @@ export function registerHealthTools(server: McpServer, deps: HealthToolDeps): vo
     {
       title: 'Health metrics (daily)',
       description:
-        `Weight, blood pressure, glucose, ketones and nutrition by day (up to ${MAX_DAYS} days, ${timeZone}). ` +
+        `Weight, waist, body fat, lean mass, blood pressure, glucose, ketones and nutrition by day (up to ${MAX_DAYS} ` +
+        `days, ${timeZone}). ` +
         'protein_g, carbs_g (net carbs), total_carbs_g, fiber_g, fat_g and calories_kcal are daily sums. ' +
-        `${netCarbsRule} weight (lb), bp (mmHg), glucose (mg/dL) and ketones ` +
+        `${netCarbsRule} weight (lb), waist (in), body_fat (%), lean_mass (lb), bp (mmHg), glucose (mg/dL) and ketones ` +
         '(mmol/L) list each reading with time, value(s), unit, context and source. Readings come from Apple Health ' +
         '(source = the recording app) or from chat (source "claude-log", with the timestamp delete_reading needs). ' +
         'An Apple Health reading that duplicates a chat reading (within 15 min and 5%) is shown once.',
@@ -392,7 +394,7 @@ export function registerHealthTools(server: McpServer, deps: HealthToolDeps): vo
   // Prompts: the same three tools as ready-made commands (see prompts.ts).
 
   const metricsPromptArgs = z.object({
-    metric: z.string().optional().describe('weight, bp, glucose, ketones, protein, carbs (net carbs), fiber, fat, calories or all (default: all)'),
+    metric: z.string().optional().describe('weight, waist, body_fat, lean_mass, bp, glucose, ketones, protein, carbs (net carbs), fiber, fat, calories or all (default: all)'),
     range: z.string().optional().describe(RANGE_DESCRIPTION),
   });
   server.registerPrompt(
@@ -400,7 +402,8 @@ export function registerHealthTools(server: McpServer, deps: HealthToolDeps): vo
     {
       title: 'Health metrics',
       description:
-        'Your weight, blood pressure, glucose, ketones and nutrition (protein, net carbs, fiber, fat, calories) by day, ' +
+        'Your weight, waist, body fat, lean mass, blood pressure, glucose, ketones and nutrition (protein, net carbs, ' +
+        'fiber, fat, calories) by day, ' +
         `as a table. Net carbs: entries before ${switchover} count as entered; after it, carbs minus matching fiber.`,
       argsSchema: metricsPromptArgs,
     },
@@ -474,7 +477,7 @@ export function registerHealthTools(server: McpServer, deps: HealthToolDeps): vo
       }
       return requestMessage(
         'Choose a reading to remove',
-        `Show my ${metric ?? 'weight, blood pressure, glucose and ketone'} readings from the last 7 days using ` +
+        `Show my ${metric ?? 'weight, waist, body fat, blood pressure, glucose and ketone'} readings from the last 7 days using ` +
           'get_health_metrics, numbered, and ask me which one to remove. Then remove it with delete_reading and ' +
           'confirm. If it came from Apple Health, remind me to delete it there too.',
       );
@@ -484,6 +487,12 @@ export function registerHealthTools(server: McpServer, deps: HealthToolDeps): vo
 
 const METRIC_ALIASES: Record<string, Metric | 'all'> = {
   'blood pressure': 'bp',
+  'waist circumference': 'waist',
+  'body fat': 'body_fat',
+  'body fat percentage': 'body_fat',
+  bodyfat: 'body_fat',
+  'lean mass': 'lean_mass',
+  'lean body mass': 'lean_mass',
   'net carbs': 'carbs',
   'total carbs': 'carbs',
   'dietary fiber': 'fiber',
@@ -493,7 +502,7 @@ const METRIC_ALIASES: Record<string, Metric | 'all'> = {
   '': 'all',
 };
 
-const DAY_KEYS = ['date', 'weight', 'bp', 'glucose', 'ketones', 'protein_g', 'carbs_g', 'total_carbs_g', 'fiber_g', 'fat_g', 'calories_kcal', 'warnings'];
+const DAY_KEYS = ['date', 'weight', 'waist', 'body_fat', 'lean_mass', 'bp', 'glucose', 'ketones', 'protein_g', 'carbs_g', 'total_carbs_g', 'fiber_g', 'fat_g', 'calories_kcal', 'warnings'];
 
 /** Day fields in a fixed, readable order. */
 function ordered<T extends Record<string, unknown>>(d: T): T {

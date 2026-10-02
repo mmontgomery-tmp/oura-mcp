@@ -110,6 +110,6 @@ test('subscriptions/listen is refused at once instead of hanging the Lambda (the
   await assert.rejects(client.listen({ toolsListChanged: true } as never), /Subscription limit reached/);
   assert.ok(Date.now() - started < 2000, 'answered immediately');
   // The connection is still usable afterwards.
-  assert.equal((await client.listTools()).tools.length, 7);
+  assert.equal((await client.listTools()).tools.length, 8);
   await client.close();
 });

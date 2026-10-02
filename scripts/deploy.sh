@@ -7,7 +7,7 @@ BUDGET_EMAIL=${BUDGET_EMAIL:?Set BUDGET_EMAIL in deploy.env}
 BUDGET_LIMIT_USD=${BUDGET_LIMIT_USD:-1}
 USER_TZ=${USER_TZ:-$(readlink /etc/localtime 2>/dev/null | sed 's#.*/zoneinfo/##')}
 USER_TZ=${USER_TZ:-UTC}
-RESERVED=${RESERVED_CONCURRENCY:-2}
+RESERVED=${RESERVED_CONCURRENCY:-5}
 echo "Deploying stack '$STACK_NAME' to account $ACCOUNT_ID in $AWS_REGION (timezone $USER_TZ)"
 
 # Lambda must keep at least 10 unreserved concurrency. Brand-new accounts often start with a

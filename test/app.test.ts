@@ -9,7 +9,7 @@ for (const mode of ['auto', 'legacy'] as const) {
     const client = await connect(mode);
     const { tools } = await client.listTools();
     assert.deepEqual(tools.map((t) => t.name).sort(), [
-      'delete_reading', 'get_activity', 'get_health_metrics', 'get_heart_rate', 'get_readiness', 'get_sleep', 'log_reading',
+      'delete_reading', 'get_activity', 'get_health_metrics', 'get_heart_rate', 'get_readiness', 'get_sleep', 'get_workouts', 'log_reading',
     ]);
     const writers = new Set(['log_reading', 'delete_reading']);
     for (const t of tools) assert.equal(t.annotations?.readOnlyHint, !writers.has(t.name), t.name);

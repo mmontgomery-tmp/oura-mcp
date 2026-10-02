@@ -1,5 +1,5 @@
 import { parseInstant, sortKey } from './dates.ts';
-import { type Context, haeKeyInputs, haeSortKey, type HealthRow, type Metric, roundFor, unitFactor, UNITS } from './health.ts';
+import { bodyFatPercent, type Context, haeKeyInputs, haeSortKey, type HealthRow, type Metric, roundFor, unitFactor, UNITS } from './health.ts';
 
 // Health Auto Export (iOS) REST API automation payload, JSON export format:
 //   {"data": {"metrics": [{"name": "blood_glucose", "units": "mg/dL",
@@ -11,6 +11,9 @@ import { type Context, haeKeyInputs, haeSortKey, type HealthRow, type Metric, ro
 /** HAE metric name -> our metric. Everything else is ignored. */
 export const HAE_METRICS: Record<string, Metric> = {
   weight_body_mass: 'weight',
+  waist_circumference: 'waist',
+  body_fat_percentage: 'body_fat',
+  lean_body_mass: 'lean_mass',
   blood_pressure: 'bp',
   blood_glucose: 'glucose',
   protein: 'protein',
@@ -141,7 +144,7 @@ export function parseHaePayload(body: unknown, opts: { timeZone: string; now: Da
           skip('invalid_sample');
           continue;
         }
-        row.value = roundFor(metric, qty * factor);
+        row.value = roundFor(metric, (metric === 'body_fat' ? bodyFatPercent(qty) : qty) * factor);
         row.original_value = qty;
       }
       if (metric === 'glucose') {
@@ -181,24 +184,26 @@ function mealContext(metadata: unknown): Context | undefined {
 }
 
 /**
- * Structure-preserving redaction for the one-time "first payload" log: keeps keys, every metric
+ * Structure-preserving redaction for the one-time "first payload" logs: keeps keys, every metric
  * name and unit, sources, date strings and metadata keys; replaces numbers with "<number>"; keeps
- * the first 2 samples of each metric and says how many more there were.
+ * the first 2 samples of each metric (and of each series inside a workout, and the first 3
+ * workouts) and says how many more there were.
  */
 export function redactPayload(body: unknown): unknown {
-  const redact = (v: unknown, depth: number, key?: string): unknown => {
+  const redact = (v: unknown, depth: number, key?: string, inWorkout = false): unknown => {
     if (typeof v === 'number') return '<number>';
     if (typeof v === 'boolean' || v === null) return v;
     if (typeof v === 'string') return v.length > 80 ? `${v.slice(0, 80)}…` : v;
     if (depth > 8) return '<…>';
     if (Array.isArray(v)) {
-      // Sample lists ("data" arrays inside a metric) are shortened; the metric list is kept whole.
-      const keep = key === 'data' && depth > 1 ? 2 : 100;
-      const shown = v.slice(0, keep).map((x) => redact(x, depth + 1));
+      // Sample lists ("data" arrays inside a metric, every series inside a workout) are shortened,
+      // and so is the workout list; the metric list is kept whole.
+      const keep = (key === 'data' && depth > 1) || inWorkout ? 2 : key === 'workouts' ? 3 : 100;
+      const shown = v.slice(0, keep).map((x) => redact(x, depth + 1, undefined, inWorkout || key === 'workouts'));
       return v.length > keep ? [...shown, `<${v.length - keep} more>`] : shown;
     }
     if (v && typeof v === 'object') {
-      return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, redact(x, depth + 1, k)]));
+      return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, redact(x, depth + 1, k, inWorkout)]));
     }
     return typeof v;
   };

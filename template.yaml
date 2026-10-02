@@ -17,7 +17,7 @@ Parameters:
     Description: IANA timezone of the ring owner (e.g. America/Los_Angeles). Used to bucket heart-rate samples into days.
   ReservedConcurrency:
     Type: Number
-    Default: 2
+    Default: 5
     MinValue: 0
     Description: Reserved concurrency for the function (0 = none; needed on accounts whose concurrency quota is still 10).
   BudgetEmail:
@@ -94,7 +94,8 @@ Resources:
         AuthType: NONE # the path secret is the credential; checked in code
         InvokeMode: BUFFERED
 
-  # PK metric (weight, bp, glucose, ketones, protein, carbs, calories), SK UTC ISO 8601 timestamp
+  # PK metric (weight, waist, body_fat, lean_mass, bp, glucose, ketones, protein, carbs, fiber, fat,
+  # calories, workout), SK UTC ISO 8601 timestamp
   # (e.g. 2026-09-27T14:30:00Z). Same metric + ts overwrites. Retained if the stack is deleted,
   # because it holds health history that exists nowhere else for chat-logged readings.
   HealthTable:

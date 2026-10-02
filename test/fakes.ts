@@ -1,5 +1,6 @@
 import { CLAUDE_SOURCE, type HealthRow } from '../src/health.ts';
 import type { HealthStore } from '../src/health-store.ts';
+import type { WorkoutRow } from '../src/workouts.ts';
 import type { SecretStore } from '../src/store.ts';
 
 export function memoryStore(initial: Record<string, string> = {}): SecretStore & { data: Map<string, string>; puts: number } {
@@ -36,27 +37,34 @@ export const PARAMS = {
 /** In-memory HealthStore with the same conditions as the DynamoDB one. */
 export function memoryHealthStore(): HealthStore & {
   rows: Map<string, HealthRow>;
+  workouts: Map<string, WorkoutRow>;
   markerClaims: number;
   writes: number;
   hourlyLogs: Map<string, string>;
 } {
   const rows = new Map<string, HealthRow>();
   const k = (metric: string, ts: string) => `${metric}|${ts}`;
-  const copy = (r: HealthRow) => structuredClone(r);
-  let claimed = false;
+  const workouts = new Map<string, WorkoutRow>();
+  const copy = <T>(r: T): T => structuredClone(r);
+  const claimed = new Set<string>();
   const store = {
     rows,
+    workouts,
     markerClaims: 0,
     writes: 0,
-    async writeRows(list: HealthRow[]) {
+    async writeRows(list: (HealthRow | WorkoutRow)[]) {
       const seen = new Set<string>();
       for (const r of list) {
         // DynamoDB rejects a BatchWriteItem that repeats a key.
         if (seen.has(k(r.metric, r.ts))) throw new Error('ValidationException: Provided list of item keys contains duplicates');
         seen.add(k(r.metric, r.ts));
-        rows.set(k(r.metric, r.ts), copy(r));
+        if (r.metric === 'workout') workouts.set(r.ts, copy(r));
+        else rows.set(k(r.metric, r.ts), copy(r));
       }
       store.writes += list.length;
+    },
+    async queryWorkouts(from: string, to: string) {
+      return [...workouts.values()].filter((r) => r.ts >= from && r.ts <= to).sort((a, b) => a.ts.localeCompare(b.ts)).map(copy);
     },
     async putChatReading(row: HealthRow) {
       const existing = rows.get(k(row.metric, row.ts));
@@ -83,9 +91,9 @@ export function memoryHealthStore(): HealthStore & {
       store.hourlyLogs.set(key, hour);
       return true;
     },
-    async claimFirstPayloadLog() {
-      if (claimed) return false;
-      claimed = true;
+    async claimFirstPayloadLog(kind: 'metrics' | 'workouts' = 'metrics') {
+      if (claimed.has(kind)) return false;
+      claimed.add(kind);
       store.markerClaims++;
       return true;
     },

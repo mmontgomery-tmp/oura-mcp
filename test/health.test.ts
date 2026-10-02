@@ -437,12 +437,12 @@ test('get_health_metrics prompt: listed with its arguments and embeds the same d
   await client.close();
 });
 
-test('all 7 tools have a matching prompt; Oura prompts embed the same data as the tools', async () => {
+test('all 8 tools have a matching prompt; Oura prompts embed the same data as the tools', async () => {
   const { connect } = setup();
   const client = await connect('auto');
   const { prompts } = await client.listPrompts();
   assert.deepEqual(prompts.map((p) => p.name).sort(), [
-    'delete_reading', 'get_activity', 'get_health_metrics', 'get_heart_rate', 'get_readiness', 'get_sleep', 'log_reading',
+    'delete_reading', 'get_activity', 'get_health_metrics', 'get_heart_rate', 'get_readiness', 'get_sleep', 'get_workouts', 'log_reading',
   ]);
   const embedded = (r: { messages: { content: unknown }[] }) => {
     const text = (r.messages[0].content as { text: string }).text;

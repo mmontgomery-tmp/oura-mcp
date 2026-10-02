@@ -1,23 +1,23 @@
 # Personal health MCP backend on AWS Lambda
 
 One Lambda Function URL serves two things:
-- **An MCP server for claude.ai.** It has read-only Oura Ring tools, plus tools to log, delete and read home health readings.
+- **An MCP server for claude.ai.** It has read-only Oura Ring tools, tools to log, delete and read home health readings, and a workouts tool.
 - **An ingest endpoint for Apple Health data,** sent by the iPhone app Health Auto Export (HAE).
 
-Health readings from both paths share one DynamoDB table.
+Health readings from both paths, and workouts, share one DynamoDB table.
 
 ```
 claude.ai ──POST /mcp/<path-secret>──────┐      Health Auto Export (iPhone)
                                          │        │ POST /ingest/<ingest-path-secret>
                                          ▼        ▼   + header X-Ingest-Key
-                  Lambda (Node 24, arm64, 256 MB, reserved concurrency 2)
+                  Lambda (Node 24, arm64, 256 MB, reserved concurrency 5)
                   @modelcontextprotocol/server v2, stateless Streamable HTTP
                      │                    │                          │
       SSM Parameter Store (SecureString)  │ api.ouraring.com         DynamoDB (on-demand)
       /oura-mcp/path-secret               │ (OAuth2)                 PK metric, SK ts
-      /oura-mcp/ingest-path-secret        │                          weight bp glucose ketones
-      /oura-mcp/ingest-key                │                          protein carbs fat calories
-      /oura-mcp/oauth-client              │
+      /oura-mcp/ingest-path-secret        │                          weight waist body_fat lean_mass
+      /oura-mcp/ingest-key                │                          bp glucose ketones protein
+      /oura-mcp/oauth-client              │                          carbs fiber fat calories workout
       /oura-mcp/tokens  ◀── rotated Oura refresh token written back here
 ```
 
@@ -63,19 +63,30 @@ How the Oura fields are defined:
 - **`undo: true`** restores a removed Apple Health reading.
 
 **`get_health_metrics(metric, start_date?, end_date?)`**
-- `metric` is one of `weight bp glucose ketones protein carbs fiber fat calories`, or `all`. `carbs` always returns **net carbs** (see *Net carbs* below). The range can be up to 92 days.
+- `metric` is one of `weight waist body_fat lean_mass bp glucose ketones protein carbs fiber fat calories`, or `all`. `carbs` always returns **net carbs** (see *Net carbs* below). The range can be up to 92 days.
 - Returns `{range, timezone, days, days_without_data, notes?}`. Each day has:
   - `protein_g`, `carbs_g` (net carbs), `total_carbs_g`, `fiber_g`, `fat_g` and `calories_kcal` as daily sums, plus `warnings` when net carbs had to be clamped or some fiber wasn't subtracted
-  - `weight`, `bp`, `glucose` and `ketones` as lists of readings `{time, value | systolic+diastolic, unit, context?, source, note?, timestamp?}`
+  - `weight` (lb), `waist` (in), `body_fat` (%), `lean_mass` (lb), `bp`, `glucose` and `ketones` as lists of readings `{time, value | systolic+diastolic, unit, context?, source, note?, timestamp?}`
 - `timestamp` appears on `claude-log` readings. Apple Health readings show `time` (HH:MM), which is enough for `delete_reading`.
 - **Duplicates:** an Apple Health reading and a `claude-log` reading of the same metric, within 15 minutes and within 5% of each other (both systolic and diastolic for BP), count as one reading.
   - Only the `claude-log` one is returned, and a note says how many were hidden.
   - Each reading pairs with at most one other, closest in time first. Neither row is deleted.
 - Responses are capped at 1,000 readings, with a note if any were left out.
 
+### Workouts
+
+**`get_workouts(start_date?, end_date?)`**
+- Workouts recorded in Apple Health (for example Peloton rides), sent by a Health Auto Export "Workouts" automation. The range can be up to 92 days.
+- Returns `{range, timezone, workouts, days, days_without_workouts, notes?}`.
+  - `workouts` has one row per workout: `date`, `start` and `end` (local HH:MM), `type`, `duration_min`, `active_kcal`, `avg_hr_bpm`, `max_hr_bpm` and `source`. The energy and heart-rate fields appear only when the workout recorded them.
+  - `days` has the daily totals: `workouts`, `duration_min` and `active_kcal`.
+- A workout belongs to the day it started, in `USER_TZ`.
+- `source` is the recording app when the payload names one, otherwise `unknown` (see *Workouts* under ingest).
+- Workouts edited or deleted in Apple Health drop out after two pushes at least 15 minutes apart, like other samples.
+
 ### Prompts
 
-Tools never appear in a chat's menus; Claude calls them itself. So the server also publishes a **prompt** for each of the 7 tools, under the same name. Clients list these as ready-made commands:
+Tools never appear in a chat's menus; Claude calls them itself. So the server also publishes a **prompt** for each of the 8 tools, under the same name. Clients list these as ready-made commands:
 - **claude.ai chats:** the message box's "+" menu → Connectors → this connector.
 - **Claude Code:** `/mcp__<connector>__<name>`.
 
@@ -83,6 +94,7 @@ Tools never appear in a chat's menus; Claude calls them itself. So the server al
 |---|---|---|
 | `get_sleep`, `get_heart_rate`, `get_readiness`, `get_activity` | `range` | Runs the same query as the tool and attaches the data, with instructions to show it as a table |
 | `get_health_metrics` | `metric`, `range` | Same, for Apple Health and chat readings |
+| `get_workouts` | `range` | Same, for workouts: one row per workout, then totals |
 | `log_reading` | `metric`*, `value`*, `time`, `context`, `note` | Pre-fills a request; Claude then saves the reading with the tool |
 | `delete_reading` | `metric`, `timestamp` | Pre-fills a request to remove a reading, or asks you to pick one from the last 7 days |
 
@@ -123,14 +135,17 @@ On-demand DynamoDB, `PK = metric`, `SK = ts`. It's named in the stack output `He
   - optional `context` and `note`
   - `recorded_at` and `ingested_at`
 - **Normalized units:**
-  - weight `lb`
+  - weight and lean mass `lb`
+  - waist `in` (cm is ÷ 2.54)
+  - body fat `%` (a value of 1 or less is a fraction and is × 100)
   - bp `mmHg`
   - glucose `mg/dL` (mmol/L from Apple Health is × 18.016)
   - ketones `mmol/L`
   - protein, carbs, fiber and fat `g`
   - calories `kcal` (kJ is ÷ 4.184)
 - **Retained on stack delete.** The table has `DeletionPolicy: Retain`, so readings you logged in chat survive a teardown.
-- **One bookkeeping row.** `metric = _meta`, `ts = hae-first-payload-logged` records that the first Health Auto Export payload has been logged. No tool ever reads it.
+- **Workouts** are rows with `metric = workout`. `ts` is the start (UTC second) plus a fingerprint of the workout's Health Auto Export `id`. Each row stores `name` (the workout type), `start`, `end`, `duration_s`, `active_kcal`, `avg_hr_bpm`, `max_hr_bpm`, `source`, `hae_id`, and `recorded_at` / `recorded_end` (the times as sent).
+- **Bookkeeping rows.** `metric = _meta` rows record that the first Health Metrics payload and the first Workouts payload have been logged (`hae-first-payload-logged`, `hae-first-workout-payload-logged`), and when a skipped reconciliation was last logged. No tool ever reads them.
 - **Permissions:** the Lambda can only `Query`, `PutItem`, `DeleteItem` and `BatchWriteItem` on this table.
 
 ## Apple Health ingest (Health Auto Export)
@@ -139,7 +154,7 @@ On-demand DynamoDB, `PK = metric`, `SK = ts`. It's named in the stack output `He
 
 - **Auth:** a wrong path gets a 404, and a missing or wrong key gets a 401. Both secrets are separate from the MCP secret.
 - **Format:** HAE's JSON: `{"data": {"metrics": [{"name", "units", "data": [{"date", "qty" | "systolic"+"diastolic", "source", "metadata"?}]}]}}`. Dates look like `2026-09-27 07:30:00 -0700`. The shape and metric names were checked against HAE's reference server ([HealthyApps/health-auto-export-server](https://github.com/HealthyApps/health-auto-export-server)).
-- **Accepted metrics:** `weight_body_mass`, `blood_pressure`, `blood_glucose`, `protein`, `carbohydrates`, `fiber`, `total_fat` (stored as `fat`) and `dietary_energy`.
+- **Accepted metrics:** `weight_body_mass`, `waist_circumference` (stored as `waist`), `body_fat_percentage` (`body_fat`), `lean_body_mass` (`lean_mass`), `blood_pressure`, `blood_glucose`, `protein`, `carbohydrates`, `fiber`, `total_fat` (`fat`) and `dietary_energy`.
   - Everything else (for example `saturated_fat`, which the automation also sends) is skipped and listed in `ignored_metrics`. A malformed metric entry never fails the request.
   - The log line records each metric's unit as sent (`units`).
 - **Oura samples dropped:** any sample whose `source` contains "Oura" (in any case) is dropped.
@@ -148,15 +163,24 @@ On-demand DynamoDB, `PK = metric`, `SK = ts`. It's named in the stack output `He
 - **Same-timestamp samples:** Apple Health often stamps several food entries with the same time. Each sample is stored as its own row (see `ts` above), and the daily totals add them up.
 - **Re-sends:** samples already stored unchanged aren't written again. The reply counts them as `rows_unchanged`.
 - **Deleted or edited samples:** on full "Previous 7 Days" and "Today" pushes, a stored sample that disappears is marked `missing_since`, then `superseded_at` if a push 15 or more minutes later still lacks it. "Today" pushes cover today's rows, so same-day edits are retired the same day. `get_health_metrics` ignores superseded rows, and nothing is ever deleted. The guard rules are in [docs/RUNBOOK.md](docs/RUNBOOK.md#health-auto-export-settings).
+- **Workouts:** a "Workouts" automation sends `{"data": {"workouts": [...]}}` instead of metrics, to the same URL.
+  - Read from each workout: `id`, `name`, `start`, `end`, `duration` (seconds), `activeEnergyBurned` (kcal or kJ), and `avgHeartRate` / `maxHeartRate`. If those two are missing, the `heartRate` min/avg/max object is used, then the `heartRateData` series. Export Version 1 (no `id` or `duration`, `activeEnergy` as one object) is read too.
+  - The field names follow HAE's [Export Version 2 documentation](https://help.healthyapps.dev/en/health-auto-export/export-format/workouts/) and its reference server.
+  - **Source:** the documented format has no source on the workout itself, only on the samples inside its series. The server uses a top-level `source` if one arrives, otherwise the most common source in the active-energy series, then in any other series, and `unknown` if there is none.
+  - Workouts whose source contains "Oura" are dropped, like other Oura samples.
+  - Re-sends land on the same row (keyed by the workout's `id`), so a workout whose numbers change is updated in place.
+  - Reconciliation follows the same rules as other samples, except that the more-than-half guard looks at the whole window instead of each day. A day usually holds one workout, so a per-day guard could never retire a deleted one.
+  - The reply adds a `workouts` object with its own counts.
 - **Size limit:** bodies over 1 MB are rejected with a 413, also after gzip decompression.
 - **Response:** HTTP 200 with the counts, e.g. `{"accepted":4,"skipped":1,"skipped_reasons":{"oura_source":1},"rows_written":1,"rows_unchanged":3}`. `ignored_metrics` lists any unsupported metric names that were sent. The log line also records how many samples each metric carried and the automation's period.
-- **First payload:** it is logged once, redacted (every number becomes `"<number>"`, and only 2 samples per metric are kept). Find it in CloudWatch with `sam logs --stack-name oura-mcp --filter 'hae first payload'`. To log another one, delete the bookkeeping row: `aws dynamodb delete-item --table-name <HealthTableName> --key '{"metric":{"S":"_meta"},"ts":{"S":"hae-first-payload-logged"}}'`.
+- **First payload:** the first Health Metrics payload and the first Workouts payload are each logged once, redacted (every number becomes `"<number>"`; only 2 samples per metric or workout series and 3 workouts are kept). Find them in CloudWatch with `sam logs --stack-name oura-mcp --filter 'hae first payload'` and `--filter 'hae first workout payload'`. To log another one, delete the bookkeeping row: `aws dynamodb delete-item --table-name <HealthTableName> --key '{"metric":{"S":"_meta"},"ts":{"S":"hae-first-payload-logged"}}'`.
 
 ### Health Auto Export settings
 
 The full settings, and what happens to samples deleted in Apple Health, are in [docs/RUNBOOK.md → Health Auto Export settings](docs/RUNBOOK.md#health-auto-export-settings). In short: REST API automations sending JSON Version 2, with Summarize Data OFF and Batch Requests OFF:
 - one re-sends the **Previous 7 Days** every 5 minutes. That's the 7 days *before* today; it never includes today.
 - a second sends **Today** every 5 minutes, so today's entries arrive the same day, and entries edited or deleted today are reconciled the same day.
+- two more do the same for **Workouts** (Data Type "Workouts" instead of "Health Metrics").
 
 ## Setup
 
@@ -193,11 +217,13 @@ Refreshes go to the token endpoint that issued the grant (`moi.ouraring.com` for
 
 ## Tests
 
-- **`npm test`** runs offline: 86 tests, using the official MCP client against the Lambda handler through a fake Function URL.
+- **`npm test`** runs offline: 100 tests, using the official MCP client against the Lambda handler through a fake Function URL.
   - **Oura:** the tools, both protocol eras, and refresh-token rotation, with a fake Oura that enforces single-use refresh tokens.
   - **Ingest:** HAE parsing, unit conversion, Oura filtering, auth, the 413/415/400 responses, gzip and redaction.
   - **Health tools:** `log_reading` validation, the duplicate rule, and `delete_reading` (deleting chat readings; removing, undoing and re-sending Apple Health readings; ambiguous minutes). An in-memory store applies the same conditions as DynamoDB.
   - **Fat:** `total_fat` stored as `fat` (g, mg), unknown units and malformed metrics skipped, re-sends, reconciliation, `fat_g` sums, delete and undo.
+  - **Body measurements:** waist, body fat and lean mass: units, the fraction rule, re-sends, reconciliation, delete and undo.
+  - **Workouts:** both export versions, the fallbacks for energy, heart rate and source, re-sends, reconciliation with the window guard, and `get_workouts` end to end.
   - **Connector:** `subscriptions/listen` refused at once (it used to hang the Lambda until the runtime exited).
   - **Re-sends and reconciliation:** stable sample keys, separate same-second samples, skip-unchanged, the 15-minute two-push rule, un-marking, the more-than-half skip, window edges, and metrics that are missing, empty or Oura-only.
 - **`npm run smoke`** runs curl tests of the MCP endpoint and one Oura tool against the deployed stack.

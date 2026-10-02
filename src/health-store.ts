@@ -9,11 +9,12 @@ import {
   type WriteRequest,
 } from '@aws-sdk/client-dynamodb';
 import { CLAUDE_SOURCE, type HealthRow, type Metric } from './health.ts';
+import { WORKOUT, type WorkoutRow } from './workouts.ts';
 
-/** Storage for health rows (PK metric, SK ts). An in-memory version backs the tests. */
+/** Storage for health rows and workouts (PK metric, SK ts). An in-memory version backs the tests. */
 export interface HealthStore {
   /** Upserts rows; the same metric + ts overwrites. Keys must be unique within one call. */
-  writeRows(rows: HealthRow[]): Promise<void>;
+  writeRows(rows: (HealthRow | WorkoutRow)[]): Promise<void>;
   /** Writes a chat reading unless a non-claude-log row already sits at that exact key. */
   putChatReading(row: HealthRow): Promise<{ ok: true } | { ok: false; existing: HealthRow }>;
   /** Deletes only claude-log rows. */
@@ -23,14 +24,20 @@ export interface HealthStore {
   ): Promise<{ kind: 'deleted'; row: HealthRow } | { kind: 'not_found' } | { kind: 'not_claude'; row: HealthRow }>;
   /** Rows with from <= ts <= to (both sort keys). */
   query(metric: Metric, from: string, to: string): Promise<HealthRow[]>;
-  /** True exactly once per table: gates the one-time redacted log of the first HAE payload. */
-  claimFirstPayloadLog(): Promise<boolean>;
+  /** Workouts (PK "workout") with from <= ts <= to. */
+  queryWorkouts(from: string, to: string): Promise<WorkoutRow[]>;
+  /**
+   * True exactly once per table and kind: gates the one-time redacted log of the first Health
+   * Metrics payload and of the first Workouts payload.
+   */
+  claimFirstPayloadLog(kind?: 'metrics' | 'workouts'): Promise<boolean>;
   /** True for the first caller in each `hour` for this `key` (keeps repeated log lines hourly). */
   claimHourlyLog(key: string, hour: string): Promise<boolean>;
 }
 
 // Bookkeeping row outside the metric namespace; never returned by any tool.
 export const FIRST_PAYLOAD_MARKER = { metric: '_meta', ts: 'hae-first-payload-logged' } as const;
+export const FIRST_WORKOUT_PAYLOAD_MARKER = { metric: '_meta', ts: 'hae-first-workout-payload-logged' } as const;
 
 const NAMES = { '#m': 'metric', '#t': 'ts', '#s': 'source' };
 const BATCH = 25; // BatchWriteItem limit
@@ -53,6 +60,25 @@ export function dynamoHealthStore(tableName: string, client = new DynamoDBClient
       const out = await client.send(new BatchWriteItemCommand({ RequestItems: { [TableName()]: pending } }));
       pending = out.UnprocessedItems?.[TableName()] ?? [];
     }
+  }
+
+  async function queryRange<R>(metric: string, from: string, to: string): Promise<R[]> {
+    const rows: R[] = [];
+    let start: Record<string, AttributeValue> | undefined;
+    do {
+      const out = await client.send(
+        new QueryCommand({
+          TableName: TableName(),
+          KeyConditionExpression: '#m = :m AND #t BETWEEN :from AND :to',
+          ExpressionAttributeNames: { '#m': NAMES['#m'], '#t': NAMES['#t'] },
+          ExpressionAttributeValues: { ':m': { S: metric }, ':from': { S: from }, ':to': { S: to } },
+          ExclusiveStartKey: start,
+        }),
+      );
+      for (const item of out.Items ?? []) rows.push(unmarshal(item) as unknown as R);
+      start = out.LastEvaluatedKey;
+    } while (start);
+    return rows;
   }
 
   return {
@@ -118,24 +144,8 @@ export function dynamoHealthStore(tableName: string, client = new DynamoDBClient
       }
     },
 
-    async query(metric, from, to) {
-      const rows: HealthRow[] = [];
-      let start: Record<string, AttributeValue> | undefined;
-      do {
-        const out = await client.send(
-          new QueryCommand({
-            TableName: TableName(),
-            KeyConditionExpression: '#m = :m AND #t BETWEEN :from AND :to',
-            ExpressionAttributeNames: { '#m': NAMES['#m'], '#t': NAMES['#t'] },
-            ExpressionAttributeValues: { ':m': { S: metric }, ':from': { S: from }, ':to': { S: to } },
-            ExclusiveStartKey: start,
-          }),
-        );
-        for (const item of out.Items ?? []) rows.push(unmarshal(item));
-        start = out.LastEvaluatedKey;
-      } while (start);
-      return rows;
-    },
+    query: (metric, from, to) => queryRange<HealthRow>(metric, from, to),
+    queryWorkouts: (from, to) => queryRange<WorkoutRow>(WORKOUT, from, to),
 
     async claimHourlyLog(logKey, hour) {
       try {
@@ -155,12 +165,13 @@ export function dynamoHealthStore(tableName: string, client = new DynamoDBClient
       }
     },
 
-    async claimFirstPayloadLog() {
+    async claimFirstPayloadLog(kind = 'metrics') {
+      const marker = kind === 'workouts' ? FIRST_WORKOUT_PAYLOAD_MARKER : FIRST_PAYLOAD_MARKER;
       try {
         await client.send(
           new PutItemCommand({
             TableName: TableName(),
-            Item: { ...key(FIRST_PAYLOAD_MARKER.metric, FIRST_PAYLOAD_MARKER.ts), logged_at: { S: new Date().toISOString() } },
+            Item: { ...key(marker.metric, marker.ts), logged_at: { S: new Date().toISOString() } },
             ConditionExpression: 'attribute_not_exists(#m)',
             ExpressionAttributeNames: { '#m': NAMES['#m'] },
           }),
@@ -175,7 +186,7 @@ export function dynamoHealthStore(tableName: string, client = new DynamoDBClient
 }
 
 // Rows are flat strings and numbers, so a tiny converter replaces @aws-sdk/lib-dynamodb.
-function marshal(row: HealthRow): Record<string, AttributeValue> {
+function marshal(row: HealthRow | WorkoutRow): Record<string, AttributeValue> {
   const item: Record<string, AttributeValue> = {};
   for (const [k, v] of Object.entries(row)) {
     if (typeof v === 'string') item[k] = { S: v };
