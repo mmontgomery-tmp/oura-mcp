@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# curl test against the deployed server: auth rejection, initialize, tools/list, one Oura tool call, and
-# read-only calls to the two health-table tools. It writes nothing.
+# curl test against the deployed server: auth rejection, initialize, tools/list, prompts/list, one Oura
+# tool call, and read-only calls to the two health-table tools. It writes nothing.
 # Usage: npm run smoke [-- <mcp-url>]
 source "$(dirname "$0")/common.sh"
 URL=${1:-$(./scripts/url.sh)}
@@ -25,6 +25,20 @@ rpc '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"
 echo "== tools/list"
 rpc '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
   | node -e 'for (const t of JSON.parse(require("fs").readFileSync(0)).result.tools) console.log(" -", t.name)'
+
+echo "== prompts/list (one prompt per tool)"
+tools_file=$(mktemp)
+trap 'rm -f "$tools_file"' EXIT
+rpc '{"jsonrpc":"2.0","id":5,"method":"tools/list"}' > "$tools_file"
+rpc '{"jsonrpc":"2.0","id":6,"method":"prompts/list"}' \
+  | TOOLS_FILE=$tools_file node -e '
+      const fs = require("fs");
+      const prompts = JSON.parse(fs.readFileSync(0)).result.prompts;
+      const tools = JSON.parse(fs.readFileSync(process.env.TOOLS_FILE)).result.tools.map((t) => t.name).sort();
+      for (const p of prompts) console.log(" -", p.name, "(" + (p.arguments ?? []).map((a) => a.name + (a.required ? "*" : "")).join(", ") + ")");
+      const names = prompts.map((p) => p.name).sort();
+      if (JSON.stringify(names) !== JSON.stringify(tools)) { console.log("MISMATCH: tools", tools.join(","), "prompts", names.join(",")); process.exit(1) }
+      console.log(names.length + " prompts, one per tool")'
 
 echo "== tools/call get_sleep (last 3 days)"
 start=$(date -v-2d +%F 2>/dev/null || date -d '2 days ago' +%F)

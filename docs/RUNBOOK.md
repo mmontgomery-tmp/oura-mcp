@@ -25,7 +25,7 @@ npm ci                          # after a fresh clone
 
 ```bash
 npm test               # offline: every test, on an in-memory store
-npm run smoke          # live and read-only: MCP endpoint, one Oura tool, get_health_metrics and get_workouts (counts only)
+npm run smoke          # live and read-only: MCP endpoint, tool and prompt lists, one Oura tool, get_health_metrics and get_workouts (counts only)
 sam logs --stack-name oura-mcp --region us-east-1 --tail
 ```
 

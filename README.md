@@ -227,7 +227,7 @@ Refreshes go to the token endpoint that issued the grant (`moi.ouraring.com` for
   - **Re-sends and reconciliation:** stable sample keys, separate same-second samples, skip-unchanged, the 15-minute two-push rule, un-marking, the more-than-half skip, window edges, "Today" pushes, and metrics that are missing, empty or Oura-only.
   - **Connector:** `subscriptions/listen` refused at once (it used to hang the Lambda until the runtime exited).
 - **GitHub Actions** runs the type check and `npm test` on every push and pull request ([.github/workflows/test.yml](.github/workflows/test.yml)).
-- **`npm run smoke`** checks the deployed stack with curl and writes nothing: the auth rejection, the MCP handshake, the tool list, one Oura tool, and read-only calls to `get_health_metrics` and `get_workouts` (it prints counts, not readings).
+- **`npm run smoke`** checks the deployed stack with curl and writes nothing: the auth rejection, the MCP handshake, the tool list, the prompt list (one prompt per tool), one Oura tool, and read-only calls to `get_health_metrics` and `get_workouts` (it prints counts, not readings).
 
 ## Cost
 
