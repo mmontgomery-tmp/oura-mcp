@@ -196,11 +196,12 @@ test("across midnight: yesterday's rows stay correct when the 7-day push picks t
 });
 
 test('end to end: the ingest endpoint reconciles a "Today" push and get_health_metrics follows', async () => {
-  // The Lambda test clock only accepts dates before 2010.
+  // The harness sets the server's clock for each push.
   const { ingest, connect } = setup();
   const send = (protein: Sample[], time: string) =>
     ingest({ data: { metrics: [{ name: 'protein', units: 'g', data: protein.map((s) => ({ source: 'Cal AI', ...s })) }] } }, {
-      headers: { 'automation-period': 'Today', 'x-smoke-test-now': `2001-02-10T${time}:00-08:00` },
+      headers: { 'automation-period': 'Today' },
+      now: `2001-02-10T${time}:00-08:00`,
     }).then((res) => res.json() as Promise<{ reconcile: string; marked_missing: number; superseded: number }>);
   const lunch = { date: '2001-02-10 12:30:00 -0800', qty: 40 };
   const lunchEdited = { date: '2001-02-10 13:10:00 -0800', qty: 45 };
@@ -217,14 +218,4 @@ test('end to end: the ingest endpoint reconciles a "Today" push and get_health_m
   assert.equal(confirmed.superseded, 1);
   assert.equal(await total(), 55, '45 + 10; the replaced 40 g is ignored');
   await client.close();
-});
-
-test('the test clock header is refused unless the deployment allows it', async () => {
-  const { ingest, health } = setup({ allowTestClock: false });
-  const res = await ingest({ data: { metrics: [{ name: 'protein', units: 'g', data: [{ date: '2001-02-10 12:30:00 -0800', qty: 40, source: 'Cal AI' }] }] } }, {
-    headers: { 'automation-period': 'Today', 'x-smoke-test-now': '2001-02-10T12:35:00-08:00' },
-  });
-  assert.equal(res.status, 400);
-  assert.match(((await res.json()) as { error: string }).error, /test clock is off/);
-  assert.equal(health.rows.size, 0, 'nothing is stored');
 });

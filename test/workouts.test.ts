@@ -265,3 +265,72 @@ test('end to end: a Workouts push through the ingest endpoint, then get_workouts
   assert.deepEqual(line.workout_types, { 'Indoor Cycling': 4, Walking: 1 });
   assert.ok((line.workout_fields as string[]).includes('activeEnergyBurned'));
 });
+
+test('delete_reading removes a workout by its start time; undo restores it; a push that still has it clears the mark', async () => {
+  const { ingest, connect, health } = setup();
+  const send = (workouts: unknown[]) =>
+    ingest({ data: { workouts } }, { headers: { 'automation-period': 'Previous 7 Days' } }).then(
+      (res) => res.json() as Promise<{ workouts: { restored: number; rows_unchanged: number; marked_missing: number } }>,
+    );
+  const fri = ride('2026-09-25', { id: 'fri', minutes: 45, kcal: 480 });
+  const sat = ride('2026-09-26', { id: 'sat', minutes: 30, kcal: 320 });
+  const satTwin = { ...ride('2026-09-26', { id: 'sat-twin', minutes: 20, kcal: 200 }), start: '2026-09-26 07:00:30 -0700' }; // same minute
+  await send([fri, sat, satTwin]);
+
+  const client = await connect('auto');
+  const call = (args: Record<string, unknown>) => client.callTool({ name: 'delete_reading', arguments: { metric: 'workout', ...args } });
+  const error = async (args: Record<string, unknown>) => {
+    const r = (await call(args)) as { isError?: boolean; content: { text: string }[] };
+    assert.equal(r.isError, true);
+    return r.content[0].text;
+  };
+  const listed = async () =>
+    rows(await client.callTool({ name: 'get_workouts', arguments: { start_date: '2026-09-25', end_date: '2026-09-26' } }));
+
+  // Two workouts started at 07:00 on Saturday: nothing changes until one is picked.
+  assert.match(await error({ timestamp: '2026-09-26T07:00' }), /2 workouts started at .*30 min.*20 min.*Nothing was changed/);
+  assert.match(await error({ timestamp: '2026-09-24T07:00' }), /No workout started at 2026-09-24T07:00\. Check the start time with get_workouts/);
+  assert.match(await error({ timestamp: '2026-09-25T07:00', undo: true }), /No removed workout/);
+  assert.equal((await listed()).workouts.length, 3);
+
+  const removed = rows(await call({ timestamp: '2026-09-26T07:00', value: 20 }));
+  assert.deepEqual(removed.removed, {
+    metric: 'workout', date: '2026-09-26', start: '07:00', end: '07:20', type: 'Indoor Cycling', duration_min: 20,
+    active_kcal: 200, avg_hr_bpm: 142, max_hr_bpm: 168, source: 'Bike App', timestamp: '2026-09-26T07:00:30-07:00',
+  });
+  assert.match(removed.note, /delete it there first/);
+  let out = await listed();
+  assert.deepEqual(out.workouts.map((w: { duration_min: number }) => w.duration_min), [45, 30]);
+  assert.deepEqual(out.days[1], { date: '2026-09-26', workouts: 1, duration_min: 30, active_kcal: 320 });
+  const row = [...health.workouts.values()].find((w) => w.hae_id === 'sat-twin')!;
+  assert.equal(row.superseded_by, 'chat', 'marked, never deleted');
+  assert.equal(health.workouts.size, 3);
+
+  // A push without it (it was deleted in Apple Health too) leaves it removed.
+  const without = await send([fri, sat]);
+  assert.deepEqual([without.workouts.restored, without.workouts.marked_missing], [0, 0]);
+  assert.equal((await listed()).workouts.length, 2);
+
+  // undo, by the exact start time this time.
+  const restored = rows(await call({ timestamp: '2026-09-26T07:00:30-07:00', undo: true }));
+  assert.equal(restored.restored.duration_min, 20);
+  assert.equal((await listed()).workouts.length, 3);
+
+  // Removed again while it is still in Apple Health: the next push sends it and clears the mark.
+  rows(await call({ timestamp: '2026-09-25T07:00' }));
+  assert.equal((await listed()).workouts.length, 2);
+  const again = await send([fri, sat, satTwin]);
+  assert.equal(again.workouts.restored, 1);
+  out = await listed();
+  assert.equal(out.workouts.length, 3);
+
+  // The tool and its prompt accept "workout"; log_reading does not.
+  const { tools } = await client.listTools();
+  const schema = (name: string) => JSON.stringify(tools.find((t) => t.name === name));
+  assert.ok(schema('delete_reading').includes('"workout"') && !schema('log_reading').includes('"workout"'));
+  const prompt = await client.getPrompt({ name: 'delete_reading', arguments: { metric: 'workout', timestamp: '2026-09-25T07:00' } });
+  assert.match((prompt.messages[0].content as { text: string }).text, /Remove my workout that started at 2026-09-25T07:00 with the delete_reading tool/);
+  const pick = await client.getPrompt({ name: 'delete_reading', arguments: { metric: 'workout' } });
+  assert.match((pick.messages[0].content as { text: string }).text, /get_workouts/);
+  await client.close();
+});

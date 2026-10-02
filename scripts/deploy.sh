@@ -69,8 +69,7 @@ sam deploy \
     "UserTimezone=$USER_TZ" \
     "ReservedConcurrency=$RESERVED" \
     "BudgetEmail=$BUDGET_EMAIL" \
-    "BudgetLimitUsd=$BUDGET_LIMIT_USD" \
-    "AllowTestClock=${ALLOW_TEST_CLOCK:-false}"
+    "BudgetLimitUsd=$BUDGET_LIMIT_USD"
 
 # The endpoints contain secrets, so they are not printed here (deploy output ends up in terminal
 # scrollback, chat transcripts and CI logs).

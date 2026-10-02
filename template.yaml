@@ -28,11 +28,6 @@ Parameters:
     Type: Number
     Default: 1
     Description: Monthly account-wide cost budget in USD.
-  AllowTestClock:
-    Type: String
-    Default: 'false'
-    AllowedValues: ['true', 'false']
-    Description: Lets the ingest endpoint honor the x-smoke-test-now header (scripts/health-smoke.sh, test data before 2010 only).
 
 Conditions:
   HasReservedConcurrency: !Not [!Equals [!Ref ReservedConcurrency, 0]]
@@ -73,7 +68,6 @@ Resources:
           PARAM_PREFIX: !Ref ParamPrefix
           USER_TZ: !Ref UserTimezone
           TABLE_NAME: !Ref HealthTable
-          ALLOW_TEST_CLOCK: !Ref AllowTestClock
       Policies:
         - Version: '2012-10-17'
           Statement:

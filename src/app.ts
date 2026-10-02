@@ -12,8 +12,6 @@ export interface HandlerDeps {
   store: SecretStore;
   health: HealthStore;
   timeZone: string;
-  /** Honor the ingest endpoint's x-smoke-test-now header (off unless ALLOW_TEST_CLOCK=true). */
-  allowTestClock?: boolean;
   fetch?: typeof fetch;
   now?: () => Date;
   log?: (msg: string, extra?: Record<string, unknown>) => void;
@@ -123,7 +121,7 @@ export function createLambdaHandler(deps: HandlerDeps) {
         log('rejected: bad or missing X-Ingest-Key', { method, ip, ...(await describeKeyProblem(event.headers ?? {})) });
         return { statusCode: 401, headers: { 'content-type': 'application/json' }, body: '{"error":"Missing or wrong X-Ingest-Key header."}' };
       }
-      return handleIngest(event, { health: deps.health, timeZone: deps.timeZone, now: deps.now, log, allowTestClock: deps.allowTestClock });
+      return handleIngest(event, { health: deps.health, timeZone: deps.timeZone, now: deps.now, log });
     }
 
     if (!path.startsWith(MCP_MOUNT)) return NOT_FOUND;

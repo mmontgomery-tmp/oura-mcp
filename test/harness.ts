@@ -7,7 +7,7 @@ import { CLIENT, fakeOura, INGEST_KEY, INGEST_SECRET, memoryHealthStore, memoryS
 export const HOST = 'abc123.lambda-url.us-east-1.on.aws';
 export const NOW = new Date('2026-09-27T18:00:00Z'); // 11:00 in Los Angeles
 
-export function setup(opts: { tokensExpireIn?: number; data?: Record<string, unknown[]>; allowTestClock?: boolean } = {}) {
+export function setup(opts: { tokensExpireIn?: number; data?: Record<string, unknown[]> } = {}) {
   const oura = fakeOura({ data: opts.data ?? OURA_DATA });
   const store = memoryStore({
     [PARAMS.pathSecret]: PATH_SECRET,
@@ -18,13 +18,13 @@ export function setup(opts: { tokensExpireIn?: number; data?: Record<string, unk
   });
   const health = memoryHealthStore();
   const logs: Record<string, unknown>[] = [];
+  let clock = NOW;
   const lambda = createLambdaHandler({
     store,
     health,
     timeZone: 'America/Los_Angeles',
-    allowTestClock: opts.allowTestClock ?? true,
     fetch: oura.fetch,
-    now: () => NOW,
+    now: () => clock,
     log: (msg, extra) => logs.push({ msg, ...extra }),
     sleep: async () => {},
   });
@@ -62,17 +62,26 @@ export function setup(opts: { tokensExpireIn?: number; data?: Record<string, unk
     return client;
   }
 
-  /** POST a body to the ingest endpoint as Health Auto Export would. */
-  const ingest = (body: unknown, opts: { secret?: string; key?: string | null; headers?: Record<string, string> } = {}) =>
-    viaFunctionUrl(`https://${HOST}/ingest/${opts.secret ?? INGEST_SECRET}`, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        ...(opts.key === null ? {} : { 'x-ingest-key': opts.key ?? INGEST_KEY }),
-        ...opts.headers,
-      },
-      body: typeof body === 'string' || Buffer.isBuffer(body) ? body : JSON.stringify(body),
-    });
+  /**
+   * POST a body to the ingest endpoint as Health Auto Export would. `now` sets the server's clock
+   * for this one request, so reconciliation (the 15-minute rule, the 7-day window) can be driven.
+   */
+  const ingest = async (body: unknown, opts: { secret?: string; key?: string | null; headers?: Record<string, string>; now?: string } = {}) => {
+    if (opts.now) clock = new Date(opts.now);
+    try {
+      return await viaFunctionUrl(`https://${HOST}/ingest/${opts.secret ?? INGEST_SECRET}`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...(opts.key === null ? {} : { 'x-ingest-key': opts.key ?? INGEST_KEY }),
+          ...opts.headers,
+        },
+        body: typeof body === 'string' || Buffer.isBuffer(body) ? body : JSON.stringify(body),
+      });
+    } finally {
+      clock = NOW;
+    }
+  };
 
   return { oura, store, health, logs, viaFunctionUrl, connect, ingest };
 }

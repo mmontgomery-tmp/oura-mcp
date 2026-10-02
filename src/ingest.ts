@@ -29,7 +29,6 @@ export async function handleIngest(
     timeZone: string;
     now?: () => Date;
     log: (msg: string, extra?: Record<string, unknown>) => void;
-    allowTestClock?: boolean;
   },
 ): Promise<LambdaFunctionURLResult> {
   const started = Date.now();
@@ -68,22 +67,7 @@ export async function handleIngest(
     return json(400, { error: 'Body is not valid JSON.' });
   }
 
-  // Test hook for scripts/health-smoke.sh: a clock override so reconciliation (the 15-minute rule
-  // and the 7-day window) can be exercised on 2001 test data. Off unless the deployment sets
-  // ALLOW_TEST_CLOCK=true, and refused for any date from 2010 on, so it can never touch real
-  // readings.
-  let now = deps.now?.() ?? new Date();
-  const testNow = event.headers?.['x-smoke-test-now'];
-  if (testNow !== undefined) {
-    if (!deps.allowTestClock) {
-      return json(400, { error: 'The test clock is off on this deployment (x-smoke-test-now needs ALLOW_TEST_CLOCK=true).' });
-    }
-    const t = Date.parse(testNow);
-    if (!Number.isFinite(t) || new Date(t).getUTCFullYear() >= 2010) {
-      return json(400, { error: 'x-smoke-test-now is for test data only and must be a date before 2010.' });
-    }
-    now = new Date(t);
-  }
+  const now = deps.now?.() ?? new Date();
 
   let parsed;
   try {
@@ -175,7 +159,6 @@ export async function handleIngest(
     sample_fields: parsed.sample_fields,
     ...(workouts?.received ? { workout_types: workouts.types, workout_fields: workouts.fields } : {}),
     period,
-    ...(testNow !== undefined ? { test_now: now.toISOString() } : {}),
     bytes: raw.length,
     ms: Date.now() - started,
   });

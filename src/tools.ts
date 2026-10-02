@@ -7,6 +7,7 @@ import { registerHealthTools } from './health-tools.ts';
 import { registerWorkoutTools } from './workout-tools.ts';
 import { type OuraApi, OuraApiError } from './oura.ts';
 import { registerRangePrompt } from './prompts.ts';
+import { toolRunner } from './tool-run.ts';
 import {
   ACTIVITY_FIELDS,
   type DailyActivity,
@@ -77,22 +78,15 @@ export function buildServer(deps: ToolDeps): McpServer {
   // Each Oura read, kept so the matching prompt runs exactly the same query.
   const reads = new Map<string, { maxDays: number; body: (range: DateRange) => Promise<unknown> }>();
 
-  /** Wraps a tool body: resolves the range, times the call, turns errors into tool errors. */
+  const run = toolRunner(log);
+  /** Wraps an Oura read: resolves the range and logs it; errors become tool errors (tool-run.ts). */
   function tool(name: string, maxDays: number, body: (range: DateRange) => Promise<unknown>) {
     reads.set(name, { maxDays, body });
-    return async (input: RangeInput) => {
-      const started = Date.now();
-      try {
-        const range = resolveRange(input, { timeZone, maxDays, now: deps.now?.() });
-        const result = await body(range);
-        log('tool ok', { tool: name, start: range.start, end: range.end, ms: Date.now() - started });
-        return { content: [{ type: 'text' as const, text: JSON.stringify(result) }] };
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        log('tool error', { tool: name, error: message, kind: err instanceof Error ? err.name : typeof err, ms: Date.now() - started });
-        return { isError: true, content: [{ type: 'text' as const, text: message }] };
-      }
-    };
+    return run(name, (input: RangeInput, note) => {
+      const range = resolveRange(input, { timeZone, maxDays, now: deps.now?.() });
+      note({ start: range.start, end: range.end });
+      return body(range);
+    });
   }
 
   server.registerTool(

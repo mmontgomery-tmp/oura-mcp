@@ -117,10 +117,10 @@ test('chat readings are never marked', async () => {
   assert.ok(!store.rows.get('protein|2026-10-07T19:00:00Z')!.missing_since);
 });
 
-test('end to end: get_health_metrics ignores superseded samples; the test clock only accepts old dates', async () => {
+test('end to end: get_health_metrics ignores superseded samples', async () => {
   const { ingest, connect } = setup();
   const send = (metrics: Record<string, Sample[]>, at: string) =>
-    ingest(payload(metrics), { headers: { 'automation-period': 'Previous 7 Days', 'x-smoke-test-now': at } });
+    ingest(payload(metrics), { headers: { 'automation-period': 'Previous 7 Days' }, now: at });
   const a = { date: '2001-02-03 12:30:00 -0800', qty: 42 };
   const b = { date: '2001-02-03 12:30:00 -0800', qty: 18 };
   const b2 = { date: '2001-02-03 12:30:00 -0800', qty: 20 };
@@ -132,7 +132,6 @@ test('end to end: get_health_metrics ignores superseded samples; the test clock 
   const out = rows(await client.callTool({ name: 'get_health_metrics', arguments: { metric: 'protein', start_date: '2001-02-03', end_date: '2001-02-03' } }));
   assert.deepEqual(out.days, [{ date: '2001-02-03', protein_g: 62 }], '42 + 20; the replaced 18 g is ignored');
   await client.close();
-  assert.equal((await send({ protein: [a] }, '2026-10-10T12:00:00-07:00')).status, 400);
 });
 
 // ---------------------------------------------------------------------------------------
@@ -193,7 +192,8 @@ test('a skipped metric-day is logged only on the first push of each hour', async
   const { ingest, logs } = setup();
   const send = (samples: Record<string, unknown>[], at: string) =>
     ingest({ data: { metrics: [{ name: 'weight_body_mass', units: 'lb', data: samples }] } }, {
-      headers: { 'automation-period': 'Previous 7 Days', 'x-smoke-test-now': at },
+      headers: { 'automation-period': 'Previous 7 Days' },
+      now: at,
     });
   const monday = { date: '2001-02-05 07:00:00 -0800', qty: 180, source: 'Withings' };
   const wednesday = { date: '2001-02-07 07:00:00 -0800', qty: 181, source: 'Withings' };

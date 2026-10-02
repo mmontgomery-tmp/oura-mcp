@@ -61,6 +61,7 @@ How the Oura fields are defined:
 - **Chat readings** (`claude-log`) are deleted.
 - **Apple Health readings** are marked removed (`superseded_at`, `superseded_by: "chat"`) and stop counting. The reply reminds you to delete the reading in Apple Health first, because a later push that still contains it clears the mark.
 - **`undo: true`** restores a removed Apple Health reading.
+- **Workouts** are removed the same way: `metric` is `workout`, `timestamp` is the workout's start time (from `get_workouts`), and `value` is its duration in minutes if several started in that minute. A workout is always marked removed, never deleted, and `undo: true` restores it.
 
 **`get_health_metrics(metric, start_date?, end_date?)`**
 - `metric` is one of `weight waist body_fat lean_mass bp glucose ketones protein carbs fiber fat calories`, or `all`. `carbs` always returns **net carbs** (see *Net carbs* below). The range can be up to 92 days.
@@ -82,7 +83,7 @@ How the Oura fields are defined:
   - `days` has the daily totals: `workouts`, `duration_min` and `active_kcal`.
 - A workout belongs to the day it started, in `USER_TZ`.
 - `source` is the recording app when the payload names one, otherwise `unknown` (see *Workouts* under ingest).
-- Workouts edited or deleted in Apple Health drop out after two pushes at least 15 minutes apart, like other samples.
+- Workouts edited or deleted in Apple Health drop out after two pushes at least 15 minutes apart, like other samples. To remove a wrong one by hand, use `delete_reading` with `metric: "workout"`.
 
 ### Prompts
 
@@ -96,7 +97,7 @@ Tools never appear in a chat's menus; Claude calls them itself. So the server al
 | `get_health_metrics` | `metric`, `range` | Same, for Apple Health and chat readings |
 | `get_workouts` | `range` | Same, for workouts: one row per workout, then totals |
 | `log_reading` | `metric`*, `value`*, `time`, `context`, `note` | Pre-fills a request; Claude then saves the reading with the tool |
-| `delete_reading` | `metric`, `timestamp` | Pre-fills a request to remove a reading, or asks you to pick one from the last 7 days |
+| `delete_reading` | `metric`, `timestamp` | Pre-fills a request to remove a reading or a workout, or asks you to pick one from the last 7 days |
 
 \* required
 
@@ -169,13 +170,9 @@ On-demand DynamoDB, `PK = metric`, `SK = ts`. It's named in the stack output `He
   - **Source:** the documented format has no source on the workout itself, only on the samples inside its series. The server uses a top-level `source` if one arrives, otherwise the most common source in the active-energy series, then in any other series, and `unknown` if there is none.
   - Workouts whose source contains "Oura" are dropped, like other Oura samples.
   - Re-sends land on the same row (keyed by the workout's `id`), so a workout whose numbers change is updated in place.
-  - Reconciliation follows the same rules as other samples, except that the more-than-half guard looks at the whole window instead of each day. A day usually holds one workout, so a per-day guard could never retire a deleted one.
+  - Reconciliation follows the same rules as other samples, with one difference described in the runbook.
   - The reply adds a `workouts` object with its own counts.
-- **Size limit:** 6 MB (6,291,456 bytes), the most AWS allows: it's Lambda's limit on a synchronous request payload. A gzip body may inflate to the same 6 MB.
-  - AWS measures the request as Lambda receives it: the body with every double quote escaped, plus about 1 KB of wrapper. So for Health Auto Export JSON the real ceiling is about **5.5 MB per push**.
-  - Above that, AWS itself answers 413 (`... byte payload is too large for the RequestResponse invocation type`) and the function never runs, so nothing appears in its logs.
-  - A 413 from the function's own check is logged as `hae ingest rejected: too large`.
-  - What to do about a push that is too large is in [docs/RUNBOOK.md](docs/RUNBOOK.md#payload-size).
+- **Size limit:** 6 MB (6,291,456 bytes), the most AWS allows; in practice about 5.5 MB of Health Auto Export JSON. A gzip body may inflate to the same 6 MB. Details, and what to do about a push that is too large, are in [docs/RUNBOOK.md → Payload size](docs/RUNBOOK.md#payload-size).
 - **Response:** HTTP 200 with the counts, e.g. `{"accepted":4,"skipped":1,"skipped_reasons":{"oura_source":1},"rows_written":1,"rows_unchanged":3}`. `ignored_metrics` lists any unsupported metric names that were sent. The log line also records how many samples each metric carried and the automation's period.
 - **First payload:** the first Health Metrics payload and the first Workouts payload are each logged once, redacted (every number becomes `"<number>"`; only 2 samples per metric or workout series and 3 workouts are kept). Find them in CloudWatch with `sam logs --stack-name oura-mcp --filter 'hae first payload'` and `--filter 'hae first workout payload'`. To log another one, delete the bookkeeping row: `aws dynamodb delete-item --table-name <HealthTableName> --key '{"metric":{"S":"_meta"},"ts":{"S":"hae-first-payload-logged"}}'`.
 
@@ -221,28 +218,16 @@ Refreshes go to the token endpoint that issued the grant (`moi.ouraring.com` for
 
 ## Tests
 
-- **`npm test`** runs offline: 100 tests, using the official MCP client against the Lambda handler through a fake Function URL.
+- **`npm test`** runs offline, using the official MCP client against the Lambda handler through a fake Function URL. An in-memory store applies the same conditions as DynamoDB, so no test touches a real table.
   - **Oura:** the tools, both protocol eras, and refresh-token rotation, with a fake Oura that enforces single-use refresh tokens.
-  - **Ingest:** HAE parsing, unit conversion, Oura filtering, auth, the 413/415/400 responses, gzip and redaction.
-  - **Health tools:** `log_reading` validation, the duplicate rule, and `delete_reading` (deleting chat readings; removing, undoing and re-sending Apple Health readings; ambiguous minutes). An in-memory store applies the same conditions as DynamoDB.
-  - **Fat:** `total_fat` stored as `fat` (g, mg), unknown units and malformed metrics skipped, re-sends, reconciliation, `fat_g` sums, delete and undo.
-  - **Body measurements:** waist, body fat and lean mass: units, the fraction rule, re-sends, reconciliation, delete and undo.
-  - **Workouts:** both export versions, the fallbacks for energy, heart rate and source, re-sends, reconciliation with the window guard, and `get_workouts` end to end.
+  - **Ingest:** HAE parsing, unit conversion, Oura filtering, auth, the size limit, the 415/400 responses, gzip and redaction.
+  - **Health tools:** `log_reading` validation, the duplicate rule, and `delete_reading` (deleting chat readings; removing, undoing and re-sending Apple Health readings; ambiguous minutes).
+  - **Nutrition and body measurements:** fat, fiber and net carbs, waist, body fat and lean mass: units, re-sends, reconciliation, delete and undo.
+  - **Workouts:** both export versions, the fallbacks for energy, heart rate and source, re-sends, reconciliation with the window guard, `get_workouts` end to end, and removing and restoring a workout.
+  - **Re-sends and reconciliation:** stable sample keys, separate same-second samples, skip-unchanged, the 15-minute two-push rule, un-marking, the more-than-half skip, window edges, "Today" pushes, and metrics that are missing, empty or Oura-only.
   - **Connector:** `subscriptions/listen` refused at once (it used to hang the Lambda until the runtime exited).
-  - **Re-sends and reconciliation:** stable sample keys, separate same-second samples, skip-unchanged, the 15-minute two-push rule, un-marking, the more-than-half skip, window edges, and metrics that are missing, empty or Oura-only.
-- **`npm run smoke`** runs curl tests of the MCP endpoint and one Oura tool against the deployed stack.
-- **`npm run health-smoke`** runs curl tests of the health backend against the deployed stack. It covers:
-  - an HAE ingest with one weight, one BP, one glucose and one protein sample, plus one Oura-sourced sample that must be skipped
-  - `log_reading` for glucose and ketones
-  - out-of-range and wrong-unit readings being rejected
-  - an HAE glucose and a chat glucose 5 minutes apart coming back once
-  - two food entries at the same second both stored, and a re-sent payload writing nothing
-  - an edited entry: the old sample is marked missing, then superseded 16 minutes later, and the day's total ignores it
-  - a push with a metric missing, or present but empty, marking nothing
-  - `get_health_metrics` for `all`
-  - `delete_reading`: a chat reading deleted; an Apple Health reading marked removed, undone, removed again, then restored by a push that still contains it
-
-  It uses fake data dated 2001-02-03 and deletes it afterwards.
+- **GitHub Actions** runs the type check and `npm test` on every push and pull request ([.github/workflows/test.yml](.github/workflows/test.yml)).
+- **`npm run smoke`** checks the deployed stack with curl and writes nothing: the auth rejection, the MCP handshake, the tool list, one Oura tool, and read-only calls to `get_health_metrics` and `get_workouts` (it prints counts, not readings).
 
 ## Cost
 
@@ -251,17 +236,10 @@ Refreshes go to the token endpoint that issued the grant (`moi.ouraring.com` for
 
 The account-wide **monthly AWS Budget** (`BUDGET_LIMIT_USD` in `deploy.env`) emails `BUDGET_EMAIL` at 50% and 100% of actual spend, and at 100% of forecast spend. Change the amount there and re-run `npm run deploy`.
 
-## Operations
+## Operations and decisions
 
-- **Logs:** `sam logs --stack-name oura-mcp --tail`. URL secrets, the ingest key and tokens are never logged.
-- **Rotate a URL secret or the ingest key:**
-  1. Delete the parameter and re-run `npm run deploy`. A new value is generated.
-  2. Force new Lambda instances with `aws lambda update-function-configuration --function-name <FunctionName> --description "rotated $(date +%s)"`. Set the description back afterwards so the stack stays in sync.
-  3. Update the claude.ai connector or the HAE automation.
-- **Tear down:**
-  1. `sam delete --stack-name oura-mcp` removes everything except the health table, which is retained on purpose.
-  2. Remove the secrets: `aws ssm delete-parameters --names /oura-mcp/path-secret /oura-mcp/ingest-path-secret /oura-mcp/ingest-key /oura-mcp/oauth-client /oura-mcp/tokens`.
-  3. Delete the table yourself only if you no longer want the data.
+- **Operating it** (logs, redeploying, rotating a secret, restores, the size limit, tearing it down) is in [docs/RUNBOOK.md](docs/RUNBOOK.md). URL secrets, the ingest key and tokens are never logged.
+- **Why it is built this way,** and what is still undecided, is in [docs/DECISIONS.md](docs/DECISIONS.md). Every decision that changes behavior, cost or security gets an entry there.
 
 ## Licence and security
 

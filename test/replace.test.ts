@@ -123,11 +123,12 @@ test('a partial push never retires good rows', async () => {
 });
 
 test('a row removed by hand with delete_reading stays removed; later pushes neither restore nor re-mark it', async () => {
-  // The Lambda test clock only accepts dates before 2010, so the same sequence runs in 2001.
+  // The harness sets the server's clock for each push; the dates are arbitrary.
   const { ingest, connect, health } = setup();
   const send = (samples: Sample[], at: string) =>
     ingest({ data: { metrics: [{ name: 'weight_body_mass', units: 'lb', data: samples }] } }, {
-      headers: { 'automation-period': 'Previous 7 Days', 'x-smoke-test-now': `2001-02-10T${at}:00-08:00` },
+      headers: { 'automation-period': 'Previous 7 Days' },
+      now: `2001-02-10T${at}:00-08:00`,
     }).then((res) => res.json() as Promise<{ marked_missing: number; superseded: number; restored: number; rows_unchanged: number }>);
   const scaleApp = { date: '2001-02-08 07:30:10 -0800', qty: 180.5, source: 'Scale App' };
   const at1930 = { date: '2001-02-08 19:30:00 -0800', qty: 180.5, source: 'Health' };

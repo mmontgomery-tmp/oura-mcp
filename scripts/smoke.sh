@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# curl test against the deployed server: auth rejection, initialize, tools/list, one tool call.
+# curl test against the deployed server: auth rejection, initialize, tools/list, one Oura tool call, and
+# read-only calls to the two health-table tools. It writes nothing.
 # Usage: npm run smoke [-- <mcp-url>]
 source "$(dirname "$0")/common.sh"
 URL=${1:-$(./scripts/url.sh)}
@@ -29,3 +30,12 @@ echo "== tools/call get_sleep (last 3 days)"
 start=$(date -v-2d +%F 2>/dev/null || date -d '2 days ago' +%F)
 rpc "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"get_sleep\",\"arguments\":{\"start_date\":\"$start\"}}}" \
   | node -e 'const r=JSON.parse(require("fs").readFileSync(0)).result; const t=r.content[0].text; if (r.isError) { console.log("TOOL ERROR:", t); process.exit(1) } console.log(JSON.stringify(JSON.parse(t), null, 1))'
+
+# The health table, read-only: counts only, so no readings end up in the terminal scrollback.
+for name in get_health_metrics get_workouts; do
+  echo "== tools/call $name (last 3 days, counts only)"
+  args="{\"start_date\":\"$start\"}"
+  [[ $name == get_health_metrics ]] && args="{\"metric\":\"all\",\"start_date\":\"$start\"}"
+  rpc "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"$name\",\"arguments\":$args}}" \
+    | node -e 'const r=JSON.parse(require("fs").readFileSync(0)).result; const t=r.content[0].text; if (r.isError) { console.log("TOOL ERROR:", t); process.exit(1) } const d=JSON.parse(t); console.log(JSON.stringify({ range: d.range, days: d.days.length, ...(d.workouts ? { workouts: d.workouts.length } : {}) }))'
+done

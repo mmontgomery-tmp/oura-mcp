@@ -102,7 +102,7 @@ export function haeSortKey(
   return `${instant}#${fingerprint}${duplicate ? `~${duplicate}` : ''}`;
 }
 
-/** The fingerprint inputs of a stored Apple Health row (used by the key migration). */
+/** The fingerprint inputs of an Apple Health row: what haeSortKey hashes. */
 export function haeKeyInputs(row: HealthRow): { source: string; values: number[]; unit: string } {
   const values = row.metric === 'bp' ? [row.original_systolic!, row.original_diastolic!] : [row.original_value!];
   return { source: row.source, values, unit: row.original_unit };

@@ -1,0 +1,8 @@
+# Keeps the pinned GitHub Actions current. npm dependencies get Dependabot security updates only
+# (a repository setting); routine upgrades are done by hand with the tests and a redeploy.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

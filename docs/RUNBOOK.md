@@ -24,13 +24,12 @@ npm ci                          # after a fresh clone
 ## Health checks
 
 ```bash
-npm test               # offline: 100 tests
-npm run smoke          # live: MCP endpoint + one Oura tool
-npm run health-smoke   # live: ingest, log/delete, duplicates. Writes test rows dated 2001-02-03 to the PRODUCTION table and deletes them afterwards; skip it when test data must stay out of production
+npm test               # offline: every test, on an in-memory store
+npm run smoke          # live and read-only: MCP endpoint, one Oura tool, get_health_metrics and get_workouts (counts only)
 sam logs --stack-name oura-mcp --region us-east-1 --tail
 ```
 
-`health-smoke` exercises reconciliation with a test clock (the `x-smoke-test-now` header, test data dated before 2010 only). The header is refused unless the stack was deployed with `ALLOW_TEST_CLOCK=true` in `deploy.env`; without it the script runs its other checks and skips those two sections.
+Nothing here writes to the production table. GitHub Actions also runs the type check and `npm test` on every push.
 
 In the logs, look for:
 - `tool error` lines: tool failures, with their message
@@ -41,7 +40,7 @@ In the logs, look for:
 
 1. `npm test`
 2. `npm run deploy`. It builds with esbuild and deploys with SAM. It never changes existing secrets, and the connector URL stays the same. It doesn't print the URLs, because they contain secrets; see them with `npm run url` and `npm run ingest-url`.
-3. `npm run smoke && npm run health-smoke`
+3. `npm run smoke`
 
 A deploy doesn't take the connector offline: Lambda switches to the new code between requests.
 
@@ -124,7 +123,7 @@ It shows the earliest and latest restorable times, covering up to the last 35 da
    ```
    - Without `--prune`, restored rows overwrite live rows with the same key, and rows added since then are kept.
    - With `--prune`, rows written after the restore point are deleted too.
-3. **Check:** ask for `get_health_metrics` over the affected days, or run `npm run health-smoke`.
+3. **Check:** ask for `get_health_metrics` over the affected days.
 4. **Delete the restored copy:** `aws dynamodb delete-table --table-name "$TABLE-restore" --region us-east-1`
 
 **Cost:** a restore is about $0.15 per GB restored. This table is a few MB at most.
@@ -201,7 +200,7 @@ Reconciliation only runs when a push is known to be complete:
 - **Only** for metrics with at least one accepted sample in that push. A metric missing or empty because a HealthKit query failed (for example error 6 while the phone is locked) is left alone.
 - **"Previous 7 Days":** only for the six full days strictly inside the window. The oldest day may be partial, and today isn't in it.
 - **"Today":** only for today's rows, and only while the phone is in the server's time zone (`USER_TZ`). In another time zone the phone's "today" starts at a different midnight, so the push would look partial; it's stored but not reconciled, and the log line carries `reconcile_note`. The next "Previous 7 Days" push picks the day up.
-- **Workouts** follow the same rules, but the more-than-half check below covers the whole window (the six days, or today) instead of each day. A day usually holds one workout, so a per-day check could never retire a deleted one. A push with no workouts at all is never reconciled, so deleting the only workout in the window isn't picked up until another workout is in it.
+- **Workouts** follow the same rules, but the more-than-half check below covers the whole window (the six days, or today) instead of each day. A day usually holds one workout, so a per-day check could never retire a deleted one. A push with no workouts at all is never reconciled, so deleting the only workout in the window isn't picked up until another workout is in it; remove it with `delete_reading` (below).
 - **Not** for a metric-day where more than half its samples would be newly marked in one push. That's logged as `hae reconcile skipped`. Rows an earlier push already marked `missing_since` aren't counted, so several rounds of edits to the same day don't add up to "more than half". A consequence: deleting *all* of a day's entries isn't picked up automatically. That includes a weekly weigh-in or BP reading deleted with no replacement (a correction *is* picked up: the old and new sample make 1 of 2, not more than half). Remove those with `delete_reading` (below).
 
 Each `hae ingest` log line shows `rows_written`, `rows_unchanged`, `marked_missing`, `superseded` and `restored`. It also shows how many samples each metric carried (`metrics`) and which sample fields arrived (`sample_fields`), so partial locked-phone pushes, or a sample ID HAE might add later, would show up. **Review these after a week of 5-minute pushes** before deciding whether superseded rows older than 30 days can be hard-deleted.
@@ -211,6 +210,7 @@ Each `hae ingest` log line shows `rows_written`, `rows_unchanged`, `marked_missi
 - **Apple Health readings** are marked removed (`superseded_at`, with `superseded_by: "chat"`) and stop counting in `get_health_metrics`.
   - The reading is still in Apple Health, so **delete it there first**. Otherwise the next Health Auto Export push sends it again and clears the mark.
   - `undo: true` restores a removed Apple Health reading. Chat readings can't be restored; log them again.
+- **Workouts** are removed the same way: `delete_reading` with `metric: "workout"` and the workout's start time (its duration in minutes as `value` if several started in that minute). They are always marked removed, never deleted, and `undo: true` restores them. Delete the workout in Apple Health first, for the same reason.
 - **Identifying the reading:** give its metric and time. To the minute is enough (`get_health_metrics` shows HH:MM). If several readings share that minute, also give the value. Food entries only show as daily totals, so give the entry's time and amount.
 
 To inspect rows directly, list that day's rows for a metric. The `superseded_at` column shows removed ones. `delete-item` is a permanent last resort; prefer `delete_reading`, which can be undone:

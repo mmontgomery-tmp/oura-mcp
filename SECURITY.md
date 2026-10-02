@@ -14,4 +14,3 @@ This is a single-user backend. If you deploy your own copy, these are the things
 - **`deploy.env` is personal** (budget email, time zone) and git-ignored. Copy `deploy.env.example`.
 - **The Lambda role is minimal:** read its own SSM parameters, write only the token parameter, and `Query`/`PutItem`/`DeleteItem`/`BatchWriteItem` on its one table.
 - **Health data stays in your account:** one DynamoDB table with point-in-time recovery, retained if the stack is deleted. Logs hold counts, metric names and error messages (an error can quote a rejected value), never secrets or URL paths, and expire after 14 days.
-- **The test clock** (`x-smoke-test-now`) is off unless the stack is deployed with `ALLOW_TEST_CLOCK=true`, sits behind both ingest secrets, and only accepts dates before 2010.
