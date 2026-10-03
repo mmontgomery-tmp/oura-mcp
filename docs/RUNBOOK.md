@@ -25,7 +25,7 @@ npm ci                          # after a fresh clone
 
 ```bash
 npm test               # offline: every test, on an in-memory store
-npm run smoke          # live and read-only: MCP endpoint, tool and prompt lists, one Oura tool, get_health_metrics and get_workouts (counts only)
+npm run smoke          # live and read-only: MCP endpoint, tool and prompt lists, one Oura tool, get_health_metrics, get_workouts and get_report_data (counts only)
 sam logs --stack-name oura-mcp --region us-east-1 --tail
 ```
 
@@ -33,6 +33,7 @@ Nothing here writes to the production table. GitHub Actions also runs the type c
 
 In the logs, look for:
 - `tool error` lines: tool failures, with their message
+- `tool ok` lines for `get_report_data` with `failed_sections`: the report page loaded, but those sections (for example Oura after a revoked grant) returned an error
 - `hae ingest` lines: accepted and skipped counts for each Health Auto Export sync. A Workouts push adds `workouts` (its counts), `workout_types` and `workout_fields`
 - `rejected:` lines: failed auth, with the reason (secrets are never logged)
 

@@ -92,18 +92,10 @@ export async function removeWorkout(
   };
 }
 
-export function registerWorkoutTools(server: McpServer, deps: WorkoutToolDeps): void {
-  const { health, timeZone, log } = deps;
-  const now = () => deps.now?.() ?? new Date();
-  const run = toolRunner(log);
-
-  const input = z.object({
-    start_date: z.string().regex(DATE_RE, 'Use YYYY-MM-DD').optional().describe('First day, inclusive (YYYY-MM-DD). Defaults to 6 days before end_date.'),
-    end_date: z.string().regex(DATE_RE, 'Use YYYY-MM-DD').optional().describe(`Last day, inclusive (YYYY-MM-DD). Defaults to today in ${timeZone}.`),
-  });
-
-  /** The get_workouts read, shared by the tool and the prompt. */
-  async function readWorkouts(range: DateRange) {
+/** The get_workouts read, shared by the tool, its prompt and get_report_data. */
+export function createWorkoutReader(deps: { health: HealthStore; timeZone: string }) {
+  const { health, timeZone } = deps;
+  return async function readWorkouts(range: DateRange) {
     // Pad a UTC day each side (any timezone's local days are then covered), filter by local date.
     const stored = await health.queryWorkouts(`${addDays(range.start, -1)}T00:00:00Z`, `${addDays(range.end, 2)}T00:00:00Z`);
     type Day = { date: string; workouts: number; duration_min: number; active_kcal?: number };
@@ -138,7 +130,20 @@ export function registerWorkoutTools(server: McpServer, deps: WorkoutToolDeps): 
       days_without_workouts: eachDay(range).filter((d) => !days.has(d)),
       ...(left ? { notes: [`Showing the first ${MAX_WORKOUTS} workouts; ask for a shorter range for the other ${left}. Daily totals cover all of them.`] } : {}),
     };
-  }
+  };
+}
+
+export function registerWorkoutTools(server: McpServer, deps: WorkoutToolDeps): void {
+  const { health, timeZone, log } = deps;
+  const now = () => deps.now?.() ?? new Date();
+  const run = toolRunner(log);
+
+  const input = z.object({
+    start_date: z.string().regex(DATE_RE, 'Use YYYY-MM-DD').optional().describe('First day, inclusive (YYYY-MM-DD). Defaults to 6 days before end_date.'),
+    end_date: z.string().regex(DATE_RE, 'Use YYYY-MM-DD').optional().describe(`Last day, inclusive (YYYY-MM-DD). Defaults to today in ${timeZone}.`),
+  });
+
+  const readWorkouts = createWorkoutReader({ health, timeZone });
 
   server.registerTool(
     'get_workouts',

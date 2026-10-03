@@ -78,3 +78,8 @@ Removed `npm run health-smoke`, which wrote dated test rows to the production ta
 ### D-013 · Tests run on GitHub Actions · 2026-10-02
 A workflow runs the type check and `npm test` on every push and pull request. Actions are pinned to commit hashes and the workflow token is read-only.
 **Why:** tests only ran on one laptop, so nothing checked a push or a dependency update.
+
+### D-015 · One read-only call for the report page · 2026-10-02
+`get_report_data(start_date?, end_date?)` returns `{range, timezone, health, sleep, activity, readiness, workouts}`, each section exactly the payload of the matching tool for the same range. It runs the sections in parallel inside one invocation, fetches Oura's sleep periods once for both sleep and readiness, and returns `{error: {message}}` for a failing section instead of failing the call. The range is up to 366 days. It has no MCP prompt, and its description tells chats to keep using the individual tools.
+**Why:** the Weekly Oura Summary page made five calls per load, two at a time, each a separate round trip through claude.ai and a separate Lambda invocation, and three of five measured page loads hit a cold start. One call pays for one invocation and at most one cold start. The table was not the bottleneck: `get_health_metrics` already runs its per-metric queries in parallel, so the table and its keys are unchanged.
+**Cost of it:** a second way to read the same data, kept in step by tests that compare each section with its tool. A 366-day response is about 300 KB.

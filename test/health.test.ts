@@ -461,7 +461,7 @@ test('get_health_metrics prompt: listed with its arguments and embeds the same d
   await client.close();
 });
 
-test('all 8 tools have a matching prompt; Oura prompts embed the same data as the tools', async () => {
+test('every tool but get_report_data has a matching prompt; Oura prompts embed the same data as the tools', async () => {
   const { connect } = setup();
   const client = await connect('auto');
   const { prompts } = await client.listPrompts();

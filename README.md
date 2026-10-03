@@ -1,7 +1,7 @@
 # Personal health MCP backend on AWS Lambda
 
 One Lambda Function URL serves two things:
-- **An MCP server for claude.ai.** It has read-only Oura Ring tools, tools to log, delete and read home health readings, and a workouts tool.
+- **An MCP server for claude.ai.** It has read-only Oura Ring tools, tools to log, delete and read home health readings, a workouts tool, and one tool that feeds a report page.
 - **An ingest endpoint for Apple Health data,** sent by the iPhone app Health Auto Export (HAE).
 
 Health readings from both paths, and workouts, share one DynamoDB table.
@@ -85,9 +85,22 @@ How the Oura fields are defined:
 - `source` is the recording app when the payload names one, otherwise `unknown` (see *Workouts* under ingest).
 - Workouts edited or deleted in Apple Health drop out after two pushes at least 15 minutes apart, like other samples. To remove a wrong one by hand, use `delete_reading` with `metric: "workout"`.
 
+### Report page data
+
+**`get_report_data(start_date?, end_date?)`**, read-only. It serves the Weekly Oura Summary report page (a claude.ai artifact that calls this connector); chats should keep using the individual tools.
+
+| Tool | Max range | Returns |
+|---|---|---|
+| `get_report_data` | 366 days | `{range, timezone, health, sleep, activity, readiness, workouts}` |
+
+- **Each section** is exactly what the matching tool returns for the same range: `health` is `get_health_metrics` with `metric: "all"`, then `get_sleep`, `get_activity`, `get_readiness` and `get_workouts`.
+- **One call instead of five:** the sections run in parallel inside one invocation, and Oura's sleep periods are fetched once for both sleep and readiness.
+- **A failing section** is `{error: {message}}` in its place (for example Oura's re-authorize message), and the other sections still return. The log line lists `failed_sections`.
+- **366 days** lets the page load everything from its first day for a year in one call. With 10 food entries, a weigh-in, and a night of sleep, readiness and activity every day, a 366-day response is about 300 KB of JSON (about 340 KB as the HTTP response; a workout every day adds about 90 KB). Lambda's response limit is 6 MB.
+
 ### Prompts
 
-Tools never appear in a chat's menus; Claude calls them itself. So the server also publishes a **prompt** for each of the 8 tools, under the same name. Clients list these as ready-made commands:
+Tools never appear in a chat's menus; Claude calls them itself. So the server also publishes a **prompt** for each tool except `get_report_data` (8 prompts), under the same name. `get_report_data` has none on purpose: it only serves the report page. Clients list these as ready-made commands:
 - **claude.ai chats:** the message box's "+" menu → Connectors → this connector.
 - **Claude Code:** `/mcp__<connector>__<name>`.
 
@@ -223,11 +236,12 @@ Refreshes go to the token endpoint that issued the grant (`moi.ouraring.com` for
   - **Ingest:** HAE parsing, unit conversion, Oura filtering, auth, the size limit, the 415/400 responses, gzip and redaction.
   - **Health tools:** `log_reading` validation, the duplicate rule, and `delete_reading` (deleting chat readings; removing, undoing and re-sending Apple Health readings; ambiguous minutes).
   - **Nutrition and body measurements:** fat, fiber and net carbs, waist, body fat and lean mass: units, re-sends, reconciliation, delete and undo.
+  - **Report page data:** each section equals the individual tool's payload, sleep periods fetched once, per-section errors (an Oura collection refused, a revoked Oura grant, the health table failing), the 366-day limit.
   - **Workouts:** both export versions, the fallbacks for energy, heart rate and source, re-sends, reconciliation with the window guard, `get_workouts` end to end, and removing and restoring a workout.
   - **Re-sends and reconciliation:** stable sample keys, separate same-second samples, skip-unchanged, the 15-minute two-push rule, un-marking, the more-than-half skip, window edges, "Today" pushes, and metrics that are missing, empty or Oura-only.
   - **Connector:** `subscriptions/listen` refused at once (it used to hang the Lambda until the runtime exited).
 - **GitHub Actions** runs the type check and `npm test` on every push and pull request ([.github/workflows/test.yml](.github/workflows/test.yml)).
-- **`npm run smoke`** checks the deployed stack with curl and writes nothing: the auth rejection, the MCP handshake, the tool list, the prompt list (one prompt per tool), one Oura tool, and read-only calls to `get_health_metrics` and `get_workouts` (it prints counts, not readings).
+- **`npm run smoke`** checks the deployed stack with curl and writes nothing: the auth rejection, the MCP handshake, the tool list, the prompt list (one prompt per tool except `get_report_data`), one Oura tool, and read-only calls to `get_health_metrics`, `get_workouts` and `get_report_data` (it prints counts and sizes, not readings).
 
 ## Cost
 

@@ -55,10 +55,10 @@ export function createMetricsReader(deps: HealthToolDeps) {
   const { health, timeZone, log } = deps;
   const now = () => deps.now?.() ?? new Date();
 
-  return async function readMetrics(input: MetricsQuery) {
+  return async function readMetrics(input: MetricsQuery, maxDays = MAX_DAYS) {
     let range: DateRange;
     try {
-      range = resolveRange(input, { timeZone, maxDays: MAX_DAYS, now: now() });
+      range = resolveRange(input, { timeZone, maxDays, now: now() });
     } catch (err) {
       throw new ToolInputError(err instanceof Error ? err.message : String(err));
     }

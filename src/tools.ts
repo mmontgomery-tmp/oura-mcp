@@ -4,7 +4,9 @@ import { addDays, DATE_RE, type DateRange, daysBetween, localDateFormatter, loca
 import { NET_CARBS_SWITCHOVER_MS } from './health.ts';
 import type { HealthStore } from './health-store.ts';
 import { registerHealthTools } from './health-tools.ts';
-import { registerWorkoutTools } from './workout-tools.ts';
+import { createMetricsReader } from './health-read.ts';
+import { registerReportTool } from './report-tools.ts';
+import { createWorkoutReader, registerWorkoutTools } from './workout-tools.ts';
 import { type OuraApi, OuraApiError } from './oura.ts';
 import { registerRangePrompt } from './prompts.ts';
 import { toolRunner } from './tool-run.ts';
@@ -55,7 +57,8 @@ function instructions(timeZone: string): string {
   return `One person's health data. Oura Ring (read-only): get_sleep, get_heart_rate, get_readiness,
 get_activity. Apple Health and chat readings: get_health_metrics for weight, waist (in), body_fat (%), lean_mass (lb),
 blood pressure, glucose, ketones, protein, net carbs (carbs_g), fiber, fat and calories. Workouts recorded in Apple Health
-(for example Peloton rides): get_workouts, one row per workout plus daily totals. carbs_g is always net carbs: entries before ${t.date} ${t.time}
+(for example Peloton rides): get_workouts, one row per workout plus daily totals. get_report_data returns all of
+those sections at once for the Weekly Oura Summary report page; in chat, use the individual tools. carbs_g is always net carbs: entries before ${t.date} ${t.time}
 (${timeZone}) were entered as net carbs; from then on net carbs = total carbs minus matching fiber (total_carbs_g and
 fiber_g show the parts). Entries and workouts edited or deleted in Apple Health, today's included, are corrected automatically
 once two phone syncs at least 15 minutes apart agree; until then an edited entry can be counted twice. Whenever the
@@ -66,6 +69,67 @@ _ms milliseconds, _c degrees Celsius). Sleep metrics belong to the day the perso
 avg_hrv_ms come from the night's main sleep. Scores are Oura's 1-100 scores.`.replace(/\s+/g, ' ');
 }
 
+/**
+ * The Oura reads behind the tools, one per tool. Sleep and readiness both need Oura's sleep
+ * periods; a caller that runs both (get_report_data) fetches them once and passes them in.
+ */
+export function createOuraReads(oura: OuraApi, timeZone: string) {
+  const sleepPeriods = (range: DateRange) => oura.list<SleepPeriod>('sleep', paddedDateParams(range), SLEEP_FIELDS);
+  return {
+    sleepPeriods,
+
+    async sleep(range: DateRange, periods: Promise<SleepPeriod[]> = sleepPeriods(range)) {
+      const q = paddedDateParams(range);
+      const [p, daily, spo2] = await Promise.all([
+        periods,
+        oura.list<DailySleep>('daily_sleep', q, ['day', 'score']),
+        // BDI lives in daily_spo2, which needs the separate "spo2" scope; degrade instead of failing.
+        oura
+          .list<DailySpo2>('daily_spo2', q, ['day', 'breathing_disturbance_index', 'spo2_percentage'])
+          .catch((err: unknown) => {
+            if (err instanceof OuraApiError && err.status === 403) return null;
+            throw err;
+          }),
+      ]);
+      return summarizeSleep(range, { periods: p, daily, spo2 });
+    },
+
+    async heartRate(range: DateRange) {
+      // Samples are UTC; pad a day each side so every local day is fully covered, then bucket by timezone.
+      const windows = chunk(addDays(range.start, -1), addDays(range.end, 2), 7);
+      const [sampleChunks, periods] = await Promise.all([
+        Promise.all(
+          windows.map(([from, to]) =>
+            oura.list<HeartRateSample>(
+              'heartrate',
+              { start_datetime: `${from}T00:00:00Z`, end_datetime: `${to}T00:00:00Z` },
+              ['timestamp', 'bpm', 'source'],
+            ),
+          ),
+        ),
+        sleepPeriods(range),
+      ]);
+      return summarizeHeartRate(range, { samples: sampleChunks.flat(), periods, localDate: localDateFormatter(timeZone) });
+    },
+
+    async readiness(range: DateRange, periods: Promise<SleepPeriod[]> = sleepPeriods(range)) {
+      const [readiness, p] = await Promise.all([
+        oura.list<DailyReadiness>('daily_readiness', paddedDateParams(range), [
+          'day', 'score', 'temperature_deviation', 'temperature_trend_deviation',
+        ]),
+        periods,
+      ]);
+      return summarizeReadiness(range, { readiness, periods: p });
+    },
+
+    async activity(range: DateRange) {
+      const activity = await oura.list<DailyActivity>('daily_activity', paddedDateParams(range), ACTIVITY_FIELDS);
+      return summarizeActivity(range, { activity });
+    },
+  };
+}
+export type OuraReads = ReturnType<typeof createOuraReads>;
+
 export function buildServer(deps: ToolDeps): McpServer {
   const { oura, timeZone } = deps;
   const log = deps.log ?? ((msg, extra) => console.log(JSON.stringify({ msg, ...extra })));
@@ -73,7 +137,15 @@ export function buildServer(deps: ToolDeps): McpServer {
   registerHealthTools(server, { health: deps.health, timeZone, now: deps.now, log });
   registerWorkoutTools(server, { health: deps.health, timeZone, now: deps.now, log });
 
-  const sleepPeriods = (range: DateRange) => oura.list<SleepPeriod>('sleep', paddedDateParams(range), SLEEP_FIELDS);
+  const ouraReads = createOuraReads(oura, timeZone);
+  registerReportTool(server, {
+    oura: ouraReads,
+    readMetrics: createMetricsReader({ health: deps.health, timeZone, now: deps.now, log }),
+    readWorkouts: createWorkoutReader({ health: deps.health, timeZone }),
+    timeZone,
+    now: deps.now,
+    log,
+  });
 
   // Each Oura read, kept so the matching prompt runs exactly the same query.
   const reads = new Map<string, { maxDays: number; body: (range: DateRange) => Promise<unknown> }>();
@@ -100,21 +172,7 @@ export function buildServer(deps: ToolDeps): McpServer {
       inputSchema: rangeInput,
       annotations: { title: 'Oura sleep', ...READ_ONLY },
     },
-    tool('get_sleep', 92, async (range) => {
-      const q = paddedDateParams(range);
-      const [periods, daily, spo2] = await Promise.all([
-        sleepPeriods(range),
-        oura.list<DailySleep>('daily_sleep', q, ['day', 'score']),
-        // BDI lives in daily_spo2, which needs the separate "spo2" scope; degrade instead of failing.
-        oura
-          .list<DailySpo2>('daily_spo2', q, ['day', 'breathing_disturbance_index', 'spo2_percentage'])
-          .catch((err: unknown) => {
-            if (err instanceof OuraApiError && err.status === 403) return null;
-            throw err;
-          }),
-      ]);
-      return summarizeSleep(range, { periods, daily, spo2 });
-    }),
+    tool('get_sleep', 92, (range) => ouraReads.sleep(range)),
   );
 
   server.registerTool(
@@ -128,23 +186,7 @@ export function buildServer(deps: ToolDeps): McpServer {
       inputSchema: rangeInput,
       annotations: { title: 'Oura heart rate', ...READ_ONLY },
     },
-    tool('get_heart_rate', 31, async (range) => {
-      // Samples are UTC; pad a day each side so every local day is fully covered, then bucket by timezone.
-      const windows = chunk(addDays(range.start, -1), addDays(range.end, 2), 7);
-      const [sampleChunks, periods] = await Promise.all([
-        Promise.all(
-          windows.map(([from, to]) =>
-            oura.list<HeartRateSample>(
-              'heartrate',
-              { start_datetime: `${from}T00:00:00Z`, end_datetime: `${to}T00:00:00Z` },
-              ['timestamp', 'bpm', 'source'],
-            ),
-          ),
-        ),
-        sleepPeriods(range),
-      ]);
-      return summarizeHeartRate(range, { samples: sampleChunks.flat(), periods, localDate: localDateFormatter(timeZone) });
-    }),
+    tool('get_heart_rate', 31, (range) => ouraReads.heartRate(range)),
   );
 
   server.registerTool(
@@ -157,15 +199,7 @@ export function buildServer(deps: ToolDeps): McpServer {
       inputSchema: rangeInput,
       annotations: { title: 'Oura readiness', ...READ_ONLY },
     },
-    tool('get_readiness', 92, async (range) => {
-      const [readiness, periods] = await Promise.all([
-        oura.list<DailyReadiness>('daily_readiness', paddedDateParams(range), [
-          'day', 'score', 'temperature_deviation', 'temperature_trend_deviation',
-        ]),
-        sleepPeriods(range),
-      ]);
-      return summarizeReadiness(range, { readiness, periods });
-    }),
+    tool('get_readiness', 92, (range) => ouraReads.readiness(range)),
   );
 
   server.registerTool(
@@ -178,10 +212,7 @@ export function buildServer(deps: ToolDeps): McpServer {
       inputSchema: rangeInput,
       annotations: { title: 'Oura activity', ...READ_ONLY },
     },
-    tool('get_activity', 92, async (range) => {
-      const activity = await oura.list<DailyActivity>('daily_activity', paddedDateParams(range), ACTIVITY_FIELDS);
-      return summarizeActivity(range, { activity });
-    }),
+    tool('get_activity', 92, (range) => ouraReads.activity(range)),
   );
 
   const PROMPTS: Record<string, { title: string; what: string }> = {
