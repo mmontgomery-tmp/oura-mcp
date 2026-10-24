@@ -83,6 +83,7 @@ How the Oura fields are defined:
   - `days` has the daily totals: `workouts`, `duration_min` and `active_kcal`.
 - A workout belongs to the day it started, in `USER_TZ`.
 - `source` is the app that wrote the workout, from the workout's own source field, or `unknown` if the payload has none (see *Workouts* under ingest).
+- **Oura duplicates:** Oura detects activities and writes them as workouts, so a ride recorded by another app can also appear as a longer Oura workout around it. An Oura workout is left out of `workouts` and the daily totals when a workout from another app overlaps it for at least half of the shorter of the two; `notes` says which one and why. It stays in the table, and Oura-only workouts such as walks are always shown.
 - Workouts edited or deleted in Apple Health drop out after two pushes at least 15 minutes apart, like other samples. To remove a wrong one by hand, use `delete_reading` with `metric: "workout"`.
 
 ### Report page data
@@ -181,7 +182,7 @@ On-demand DynamoDB, `PK = metric`, `SK = ts`. It's named in the stack output `He
   - Read from each workout: `id`, `name`, `start`, `end`, `duration` (seconds), `activeEnergyBurned` (kcal or kJ), and `avgHeartRate` / `maxHeartRate`. If those two are missing, the `heartRate` min/avg/max object is used, then the `heartRateData` series. Export Version 1 (no `id` or `duration`, `activeEnergy` as one object) is read too.
   - The field names follow HAE's [Export Version 2 documentation](https://help.healthyapps.dev/en/health-auto-export/export-format/workouts/) and its reference server.
   - **Source:** the workout's own `source`, which real pushes send as `{"name": "Oura", "identifier": "com.ouraring.oura"}` (a plain name is read too). The name is stored as `source` and the identifier as `source_id`; without one, `source` is `unknown`. It is never guessed from the samples inside the workout, because those come from whatever was recording at the time.
-  - **Workouts written by Oura are kept,** unlike Oura's metric samples: a walk Oura detected may be the only record of it.
+  - **Workouts written by Oura are kept,** unlike Oura's metric samples: a walk Oura detected may be the only record of it. When another app recorded the same session, `get_workouts` leaves the Oura one out (see *Workouts* under Tools).
   - Re-sends land on the same row (keyed by the workout's `id`), so a workout whose numbers change is updated in place.
   - Reconciliation follows the same rules as other samples, with one difference described in the runbook.
   - The reply adds a `workouts` object with its own counts.
@@ -237,7 +238,7 @@ Refreshes go to the token endpoint that issued the grant (`moi.ouraring.com` for
   - **Health tools:** `log_reading` validation, the duplicate rule, and `delete_reading` (deleting chat readings; removing, undoing and re-sending Apple Health readings; ambiguous minutes).
   - **Nutrition and body measurements:** fat, fiber and net carbs, waist, body fat and lean mass: units, re-sends, reconciliation, delete and undo.
   - **Report page data:** each section equals the individual tool's payload, sleep periods fetched once, per-section errors (an Oura collection refused, a revoked Oura grant, the health table failing), the 366-day limit.
-  - **Workouts:** both export versions, the fallbacks for energy and heart rate, the workout's own source (object or name, never the samples'), an Oura workout overlapping a ride, re-sends, reconciliation with the window guard, `get_workouts` end to end, and removing and restoring a workout.
+  - **Workouts:** both export versions, the fallbacks for energy and heart rate, the workout's own source (object or name, never the samples'), Oura workouts hidden when another app recorded the same session (and kept otherwise), re-sends, reconciliation with the window guard, `get_workouts` end to end, and removing and restoring a workout.
   - **Re-sends and reconciliation:** stable sample keys, separate same-second samples, skip-unchanged, the 15-minute two-push rule, un-marking, the more-than-half skip, window edges, "Today" pushes, and metrics that are missing, empty or Oura-only.
   - **Connector:** `subscriptions/listen` refused at once (it used to hang the Lambda until the runtime exited).
 - **GitHub Actions** runs the type check and `npm test` on every push and pull request ([.github/workflows/test.yml](.github/workflows/test.yml)).

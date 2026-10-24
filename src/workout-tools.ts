@@ -92,6 +92,29 @@ export async function removeWorkout(
   };
 }
 
+export const OURA_APP_ID = 'com.ouraring.oura';
+const isOura = (w: WorkoutRow) => w.source_id === OURA_APP_ID || /oura/i.test(w.source);
+const windowMs = (w: WorkoutRow) => Date.parse(w.end) - rowTime(w);
+
+/**
+ * Oura detects activities and writes them as workouts, so a session recorded by another app (a
+ * Peloton ride) can also appear as a longer Oura workout around it. An Oura workout is hidden when
+ * a workout from another app overlaps it for at least half of the shorter of the two. Hidden
+ * workouts stay in the table, and Oura-only workouts (such as walks) are untouched. Decision D-017.
+ */
+export function overlappingOuraWorkouts(active: WorkoutRow[]): Map<WorkoutRow, WorkoutRow> {
+  const hidden = new Map<WorkoutRow, WorkoutRow>();
+  const others = active.filter((w) => !isOura(w));
+  for (const o of active.filter(isOura)) {
+    const by = others.find((n) => {
+      const overlap = Math.min(Date.parse(o.end), Date.parse(n.end)) - Math.max(rowTime(o), rowTime(n));
+      return overlap > 0 && overlap >= Math.min(windowMs(o), windowMs(n)) / 2;
+    });
+    if (by) hidden.set(o, by);
+  }
+  return hidden;
+}
+
 /** The get_workouts read, shared by the tool, its prompt and get_report_data. */
 export function createWorkoutReader(deps: { health: HealthStore; timeZone: string }) {
   const { health, timeZone } = deps;
@@ -104,9 +127,19 @@ export function createWorkoutReader(deps: { health: HealthStore; timeZone: strin
     let left = 0;
 
     // Superseded workouts were deleted or edited in Apple Health, or removed with delete_reading.
-    for (const w of stored.filter((r) => !r.superseded_at)) {
+    const active = stored.filter((r) => !r.superseded_at);
+    const hidden = overlappingOuraWorkouts(active);
+    const notes: string[] = [];
+    for (const w of active) {
       const date = localTime(rowTime(w), timeZone).date;
       if (!inRange(date, range)) continue;
+      const by = hidden.get(w);
+      if (by) {
+        const o = presentWorkout(w, timeZone);
+        const n = presentWorkout(by, timeZone);
+        notes.push(`Hidden: ${o.date} ${o.start}–${o.end} ${o.type} from ${o.source}, because ${n.type} from ${n.source} (${n.start}–${n.end}) recorded the same session.`);
+        continue;
+      }
       const d = days.get(date) ?? { date, workouts: 0, duration_min: 0 };
       d.workouts++;
       d.duration_min += w.duration_s / 60;
@@ -128,7 +161,7 @@ export function createWorkoutReader(deps: { health: HealthStore; timeZone: strin
           ...(d.active_kcal !== undefined ? { active_kcal: Math.round(d.active_kcal) } : {}),
         })),
       days_without_workouts: eachDay(range).filter((d) => !days.has(d)),
-      ...(left ? { notes: [`Showing the first ${MAX_WORKOUTS} workouts; ask for a shorter range for the other ${left}. Daily totals cover all of them.`] } : {}),
+      ...(left ? { notes: [...notes, `Showing the first ${MAX_WORKOUTS} workouts; ask for a shorter range for the other ${left}. Daily totals cover all of them.`] } : notes.length ? { notes } : {}),
     };
   };
 }
@@ -155,8 +188,10 @@ export function registerWorkoutTools(server: McpServer, deps: WorkoutToolDeps): 
         'avg_hr_bpm and max_hr_bpm when the workout recorded them, and source (the recording app, or "unknown"). ' +
         'days has the daily totals: workouts, duration_min and active_kcal. A workout belongs to the day it started. ' +
         'Workouts edited or deleted in Apple Health drop out automatically after two phone syncs at least 15 minutes ' +
-        'apart; to remove a wrong one by hand, use delete_reading with metric "workout" and its start time. For Oura ' +
-        'activity scores, steps and calories use get_activity instead.',
+        'apart; to remove a wrong one by hand, use delete_reading with metric "workout" and its start time. An Oura-' +
+        'detected workout is left out (and listed in notes) when another app recorded the same session, overlapping ' +
+        'it for at least half of the shorter of the two; Oura-only workouts are kept. For Oura activity scores, steps ' +
+        'and calories use get_activity instead.',
       inputSchema: input,
       annotations: { title: 'Workouts', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },

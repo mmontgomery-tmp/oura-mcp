@@ -360,3 +360,45 @@ test('delete_reading removes a workout by its start time; undo restores it; a pu
   assert.match((pick.messages[0].content as { text: string }).text, /get_workouts/);
   await client.close();
 });
+
+test('an Oura workout is hidden when another app recorded the same session; Oura-only workouts stay', async () => {
+  const { ingest, connect, health } = setup(); // clock: 2026-09-27 11:00 in Los Angeles
+  const OURA = { name: 'Oura', identifier: 'com.ouraring.oura' };
+  const BIKE = { name: 'Bike App', identifier: 'com.example.bikeapp' };
+  const workout = (id: string, name: string, day: string, start: string, end: string, kcal: number, source: unknown) => ({
+    id, name, start: `${day} ${start}:00 -0700`, end: `${day} ${end}:00 -0700`,
+    duration: (Date.parse(`${day}T${end}:00-07:00`) - Date.parse(`${day}T${start}:00-07:00`)) / 1000,
+    activeEnergyBurned: { qty: kcal, units: 'kcal' }, source,
+  });
+  const ringCycling = workout('ring-ride', 'Cycling', '2026-09-25', '18:05', '18:22', 140, OURA); // around the ride
+  const ride = workout('bike-ride', 'Indoor Cycling', '2026-09-25', '18:15', '18:21', 60, BIKE);
+  const ringWalk = workout('ring-walk', 'Walk', '2026-09-25', '06:30', '07:10', 180, OURA); // Oura only
+  const walkBeforeRide = workout('ring-walk-2', 'Walk', '2026-09-26', '07:00', '07:40', 150, OURA); // 2 of 40 min overlap
+  const nextRide = workout('bike-ride-2', 'Indoor Cycling', '2026-09-26', '07:38', '08:18', 400, BIKE);
+  const ringA = workout('ring-a', 'Walk', '2026-09-24', '12:00', '12:30', 100, OURA); // two Oura workouts overlapping
+  const ringB = workout('ring-b', 'Hiking', '2026-09-24', '12:10', '12:40', 120, 'Oura'); // a plain name is recognised too
+  await ingest({ data: { workouts: [ringCycling, ride, ringWalk, walkBeforeRide, nextRide, ringA, ringB] } }, { headers: { 'automation-period': 'Previous 7 Days' } });
+  assert.equal(health.workouts.size, 7, 'everything is stored');
+
+  const client = await connect('auto');
+  const read = async () => rows(await client.callTool({ name: 'get_workouts', arguments: { start_date: '2026-09-24', end_date: '2026-09-26' } }));
+  let out = await read();
+  assert.deepEqual(out.workouts.map((w: { start: string; type: string; source: string }) => `${w.start} ${w.type} ${w.source}`), [
+    '12:00 Walk Oura', '12:10 Hiking Oura', // Oura only: both kept
+    '06:30 Walk Oura', '18:15 Indoor Cycling Bike App', // the Oura "Cycling" around the ride is left out
+    '07:00 Walk Oura', '07:38 Indoor Cycling Bike App', // a 2-minute overlap is not the same session
+  ]);
+  assert.deepEqual(out.days.find((d: { date: string }) => d.date === '2026-09-25'), { date: '2026-09-25', workouts: 2, duration_min: 46, active_kcal: 240 });
+  assert.deepEqual(out.notes, ['Hidden: 2026-09-25 18:05–18:22 Cycling from Oura, because Indoor Cycling from Bike App (18:15–18:21) recorded the same session.']);
+
+  // The report page gets the same answer.
+  const report = rows(await client.callTool({ name: 'get_report_data', arguments: { start_date: '2026-09-24', end_date: '2026-09-26' } }));
+  assert.deepEqual(report.workouts, out);
+
+  // If the ride is removed, the Oura workout is all there is, so it shows again.
+  rows(await client.callTool({ name: 'delete_reading', arguments: { metric: 'workout', timestamp: '2026-09-25T18:15' } }));
+  out = await read();
+  assert.ok(out.workouts.some((w: { start: string; type: string }) => w.start === '18:05' && w.type === 'Cycling'));
+  assert.equal(out.notes, undefined);
+  await client.close();
+});
