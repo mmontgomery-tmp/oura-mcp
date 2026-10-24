@@ -82,7 +82,7 @@ How the Oura fields are defined:
   - `workouts` has one row per workout: `date`, `start` and `end` (local HH:MM), `type`, `duration_min`, `active_kcal`, `avg_hr_bpm`, `max_hr_bpm` and `source`. The energy and heart-rate fields appear only when the workout recorded them.
   - `days` has the daily totals: `workouts`, `duration_min` and `active_kcal`.
 - A workout belongs to the day it started, in `USER_TZ`.
-- `source` is the recording app when the payload names one, otherwise `unknown` (see *Workouts* under ingest).
+- `source` is the app that wrote the workout, from the workout's own source field, or `unknown` if the payload has none (see *Workouts* under ingest).
 - Workouts edited or deleted in Apple Health drop out after two pushes at least 15 minutes apart, like other samples. To remove a wrong one by hand, use `delete_reading` with `metric: "workout"`.
 
 ### Report page data
@@ -158,7 +158,7 @@ On-demand DynamoDB, `PK = metric`, `SK = ts`. It's named in the stack output `He
   - protein, carbs, fiber and fat `g`
   - calories `kcal` (kJ is ÷ 4.184)
 - **Retained on stack delete.** The table has `DeletionPolicy: Retain`, so readings you logged in chat survive a teardown.
-- **Workouts** are rows with `metric = workout`. `ts` is the start (UTC second) plus a fingerprint of the workout's Health Auto Export `id`. Each row stores `name` (the workout type), `start`, `end`, `duration_s`, `active_kcal`, `avg_hr_bpm`, `max_hr_bpm`, `source`, `hae_id`, and `recorded_at` / `recorded_end` (the times as sent).
+- **Workouts** are rows with `metric = workout`. `ts` is the start (UTC second) plus a fingerprint of the workout's Health Auto Export `id`. Each row stores `name` (the workout type), `start`, `end`, `duration_s`, `active_kcal`, `avg_hr_bpm`, `max_hr_bpm`, `source` and `source_id` (the app that wrote it), `hae_id`, and `recorded_at` / `recorded_end` (the times as sent).
 - **Bookkeeping rows.** `metric = _meta` rows record that the first Health Metrics payload and the first Workouts payload have been logged (`hae-first-payload-logged`, `hae-first-workout-payload-logged`), and when a skipped reconciliation was last logged. No tool ever reads them.
 - **Permissions:** the Lambda can only `Query`, `PutItem`, `DeleteItem` and `BatchWriteItem` on this table.
 
@@ -171,7 +171,7 @@ On-demand DynamoDB, `PK = metric`, `SK = ts`. It's named in the stack output `He
 - **Accepted metrics:** `weight_body_mass`, `waist_circumference` (stored as `waist`), `body_fat_percentage` (`body_fat`), `lean_body_mass` (`lean_mass`), `blood_pressure`, `blood_glucose`, `protein`, `carbohydrates`, `fiber`, `total_fat` (`fat`) and `dietary_energy`.
   - Everything else (for example `saturated_fat`, which the automation also sends) is skipped and listed in `ignored_metrics`. A malformed metric entry never fails the request.
   - The log line records each metric's unit as sent (`units`).
-- **Oura samples dropped:** any sample whose `source` contains "Oura" (in any case) is dropped.
+- **Oura samples dropped:** any metric sample whose `source` contains "Oura" (in any case) is dropped. Workouts are the exception (below).
 - **`source`:** set to the sample's original app, e.g. "OMRON connect".
 - **Meal timing:** if HAE passes through HealthKit's glucose meal time and it says "after meal", `context` becomes `post-meal`.
 - **Same-timestamp samples:** Apple Health often stamps several food entries with the same time. Each sample is stored as its own row (see `ts` above), and the daily totals add them up.
@@ -180,8 +180,8 @@ On-demand DynamoDB, `PK = metric`, `SK = ts`. It's named in the stack output `He
 - **Workouts:** a "Workouts" automation sends `{"data": {"workouts": [...]}}` instead of metrics, to the same URL.
   - Read from each workout: `id`, `name`, `start`, `end`, `duration` (seconds), `activeEnergyBurned` (kcal or kJ), and `avgHeartRate` / `maxHeartRate`. If those two are missing, the `heartRate` min/avg/max object is used, then the `heartRateData` series. Export Version 1 (no `id` or `duration`, `activeEnergy` as one object) is read too.
   - The field names follow HAE's [Export Version 2 documentation](https://help.healthyapps.dev/en/health-auto-export/export-format/workouts/) and its reference server.
-  - **Source:** the documented format has no source on the workout itself, only on the samples inside its series. The server uses a top-level `source` if one arrives, otherwise the most common source in the active-energy series, then in any other series, and `unknown` if there is none.
-  - Workouts whose source contains "Oura" are dropped, like other Oura samples.
+  - **Source:** the workout's own `source`, which real pushes send as `{"name": "Oura", "identifier": "com.ouraring.oura"}` (a plain name is read too). The name is stored as `source` and the identifier as `source_id`; without one, `source` is `unknown`. It is never guessed from the samples inside the workout, because those come from whatever was recording at the time.
+  - **Workouts written by Oura are kept,** unlike Oura's metric samples: a walk Oura detected may be the only record of it.
   - Re-sends land on the same row (keyed by the workout's `id`), so a workout whose numbers change is updated in place.
   - Reconciliation follows the same rules as other samples, with one difference described in the runbook.
   - The reply adds a `workouts` object with its own counts.
@@ -237,7 +237,7 @@ Refreshes go to the token endpoint that issued the grant (`moi.ouraring.com` for
   - **Health tools:** `log_reading` validation, the duplicate rule, and `delete_reading` (deleting chat readings; removing, undoing and re-sending Apple Health readings; ambiguous minutes).
   - **Nutrition and body measurements:** fat, fiber and net carbs, waist, body fat and lean mass: units, re-sends, reconciliation, delete and undo.
   - **Report page data:** each section equals the individual tool's payload, sleep periods fetched once, per-section errors (an Oura collection refused, a revoked Oura grant, the health table failing), the 366-day limit.
-  - **Workouts:** both export versions, the fallbacks for energy, heart rate and source, re-sends, reconciliation with the window guard, `get_workouts` end to end, and removing and restoring a workout.
+  - **Workouts:** both export versions, the fallbacks for energy and heart rate, the workout's own source (object or name, never the samples'), an Oura workout overlapping a ride, re-sends, reconciliation with the window guard, `get_workouts` end to end, and removing and restoring a workout.
   - **Re-sends and reconciliation:** stable sample keys, separate same-second samples, skip-unchanged, the 15-minute two-push rule, un-marking, the more-than-half skip, window edges, "Today" pushes, and metrics that are missing, empty or Oura-only.
   - **Connector:** `subscriptions/listen` refused at once (it used to hang the Lambda until the runtime exited).
 - **GitHub Actions** runs the type check and `npm test` on every push and pull request ([.github/workflows/test.yml](.github/workflows/test.yml)).

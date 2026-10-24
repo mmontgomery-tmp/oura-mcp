@@ -164,7 +164,7 @@ Both use these settings:
 | Sync cadence | every 5 minutes |
 | Batch Requests | **Off** |
 
-What the server reads from a workout, and how it picks `source`, is in the README under *Apple Health ingest → Workouts*. After the first Workouts push, check the `hae ingest` log line: `workout_fields` lists the fields the payload really carried, and the first payload is logged once, redacted, as `hae first workout payload`.
+What the server reads from a workout, including its `source` (the workout's own `{name, identifier}`), is in the README under *Apple Health ingest → Workouts*. After the first Workouts push, check the `hae ingest` log line: `workout_fields` lists the fields the payload really carried, and the first payload is logged once, redacted, as `hae first workout payload`.
 
 ### Payload size
 

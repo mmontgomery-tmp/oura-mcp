@@ -5,11 +5,14 @@
 //     "avgHeartRate": {"qty": 150, "units": "bpm"}, "maxHeartRate": {"qty": 175, "units": "bpm"},
 //     "heartRate": {"min": {...}, "avg": {...}, "max": {...}},
 //     "heartRateData": [{"date": "...", "Min": 120, "Avg": 150, "Max": 175, "units": "bpm", "source": "..."}],
-//     "activeEnergy": [{"date": "...", "qty": 50, "units": "kcal", "source": "..."}], ...}]}}
+//     "activeEnergy": [{"date": "...", "qty": 50, "units": "kcal", "source": "..."}],
+//     "source": {"name": "Oura", "identifier": "com.ouraring.oura"}, ...}]}}
 // Field names follow HAE's Export Version 2 documentation
 // (help.healthyapps.dev/en/health-auto-export/export-format/workouts) and its reference server
 // (github.com/HealthyApps/health-auto-export-server, src/models/Workout.ts). Version 1 has no id or
-// duration and sends activeEnergy as a single {qty, units}; both shapes are read.
+// duration and sends activeEnergy as a single {qty, units}; both shapes are read. The workout's own
+// "source" (the app that wrote it) is not in the documentation, but real pushes carry it as
+// {name, identifier}.
 import { createHash } from 'node:crypto';
 import { parseInstant, sortKey } from './dates.ts';
 import { unitFactor } from './health.ts';
@@ -34,8 +37,10 @@ export interface WorkoutRow {
   active_kcal?: number;
   avg_hr_bpm?: number;
   max_hr_bpm?: number;
-  /** The app that recorded it, when the payload says; otherwise "unknown". */
+  /** The app that wrote the workout (its own source name), or "unknown" if the payload has none. */
   source: string;
+  /** That app's bundle identifier, e.g. "com.ouraring.oura", when the payload has it. */
+  source_id?: string;
   /** Health Auto Export's workout id (the HealthKit sample's UUID). */
   hae_id?: string;
   via: 'hae';
@@ -48,7 +53,7 @@ export interface WorkoutRow {
   superseded_by?: 'reconcile' | 'chat';
 }
 
-export type WorkoutSkipReason = 'oura_source' | 'invalid_workout';
+export type WorkoutSkipReason = 'invalid_workout';
 
 export interface WorkoutParseResult {
   rows: WorkoutRow[];
@@ -108,11 +113,9 @@ export function parseHaeWorkouts(body: unknown, opts: { timeZone: string; now: D
       skip('invalid_workout');
       continue;
     }
-    const source = workoutSource(w);
-    if (/oura/i.test(source)) {
-      skip('oura_source');
-      continue;
-    }
+    // Workouts Oura wrote to Apple Health are kept (unlike Oura's metric samples): an Oura-detected
+    // walk may be the only record of it.
+    const { name: source, identifier: sourceId } = workoutSource(w);
 
     const duration = num(w.duration);
     const active = activeKcal(w);
@@ -129,6 +132,7 @@ export function parseHaeWorkouts(body: unknown, opts: { timeZone: string; now: D
       ...(hr.avg !== undefined ? { avg_hr_bpm: Math.round(hr.avg) } : {}),
       ...(hr.max !== undefined ? { max_hr_bpm: Math.round(hr.max) } : {}),
       source,
+      ...(sourceId ? { source_id: sourceId } : {}),
       ...(id ? { hae_id: id } : {}),
       via: 'hae',
       recorded_at: w.start as string,
@@ -188,20 +192,17 @@ function heartRate(w: Obj): { avg?: number; max?: number } {
 }
 
 /**
- * The recording app. The documented format has no source on the workout itself, only on the
- * samples inside its series, so: a top-level "source" if there is one, else the most common source
- * in the active-energy series, else in any other series.
+ * The app that wrote the workout: its own "source", sent as {"name", "identifier"} (or as a plain
+ * name). Never inferred from the samples inside the workout's series: those come from whatever
+ * recorded heart rate or energy at the time, so an Oura workout overlapping a Peloton ride used to
+ * be labelled Peloton.
  */
-function workoutSource(w: Obj): string {
-  if (typeof w.source === 'string' && w.source.trim()) return w.source.trim();
-  const series = [w.activeEnergy, ...Object.entries(w).filter(([k]) => k !== 'activeEnergy' && k !== 'route').map(([, v]) => v)];
-  for (const s of series) {
-    if (!Array.isArray(s)) continue;
-    const counts = new Map<string, number>();
-    for (const x of s as unknown[]) {
-      if (isObj(x) && typeof x.source === 'string' && x.source.trim()) counts.set(x.source.trim(), (counts.get(x.source.trim()) ?? 0) + 1);
-    }
-    if (counts.size) return [...counts.entries()].sort((a, b) => b[1] - a[1])[0][0];
+function workoutSource(w: Obj): { name: string; identifier?: string } {
+  const s = w.source;
+  if (typeof s === 'string' && s.trim()) return { name: s.trim() };
+  if (isObj(s) && typeof s.name === 'string' && s.name.trim()) {
+    const identifier = typeof s.identifier === 'string' && s.identifier.trim() ? s.identifier.trim() : undefined;
+    return { name: s.name.trim(), ...(identifier ? { identifier } : {}) };
   }
-  return 'unknown';
+  return { name: 'unknown' };
 }

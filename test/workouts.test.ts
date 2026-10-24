@@ -30,6 +30,7 @@ function ride(day: string, opts: { id?: string; start?: string; minutes?: number
     maxHeartRate: { qty: opts.max ?? 168, units: 'bpm' },
     heartRateData: [{ date: `${day} ${start} -0700`, Min: 118, Avg: 140, Max: 165, units: 'bpm', source: 'Chest Strap' }],
     activeEnergy: [{ date: `${day} ${start} -0700`, qty: 11, units: 'kcal', source: 'Bike App' }],
+    source: { name: 'Bike App', identifier: 'com.example.bikeapp' }, // real pushes send the workout's own source like this
     ...opts.extra,
   };
 }
@@ -66,7 +67,8 @@ test('a Version 2 workout: type, start, end, duration, active energy, heart rate
     active_kcal: 320,
     avg_hr_bpm: 142,
     max_hr_bpm: 168,
-    source: 'Bike App', // no source on the workout itself: taken from its active-energy series
+    source: 'Bike App', // the workout's own source, not its samples' (those say Chest Strap and Bike App)
+    source_id: 'com.example.bikeapp',
     hae_id: 'ride-2026-10-07-07:00:00',
     via: 'hae',
     recorded_at: '2026-10-07 07:00:00 -0700',
@@ -76,14 +78,21 @@ test('a Version 2 workout: type, start, end, duration, active energy, heart rate
   assert.ok(parsed.fields.includes('avgHeartRate') && parsed.fields.includes('id'));
 });
 
-test('optional fields: fallbacks for energy, heart rate and source; kJ is converted', () => {
+test('optional fields: fallbacks for energy and heart rate, the source forms; kJ is converted', () => {
   const base = { id: 'w', name: 'Indoor Cycling', start: '2026-10-07 07:00:00 -0700', end: '2026-10-07 07:30:00 -0700', duration: 1800 };
   const one = (extra: Record<string, unknown>) => parse([{ ...base, ...extra }]).rows[0];
 
   const bare = one({});
   assert.deepEqual([bare.active_kcal, bare.avg_hr_bpm, bare.max_hr_bpm, bare.source], [undefined, undefined, undefined, 'unknown']);
-  assert.equal(one({ source: 'Bike App', activeEnergy: [{ qty: 1, units: 'kcal', source: 'Watch' }] }).source, 'Bike App', 'a top-level source wins');
-  assert.equal(one({ heartRateData: [{ Avg: 140, Max: 160, source: 'Chest Strap' }] }).source, 'Chest Strap', 'else any series');
+  assert.deepEqual(
+    [one({ source: { name: 'Ring App', identifier: 'com.example.ring' } }).source, one({ source: { name: 'Ring App', identifier: 'com.example.ring' } }).source_id],
+    ['Ring App', 'com.example.ring'],
+    'the {name, identifier} object real pushes send',
+  );
+  assert.equal(one({ source: 'Bike App' }).source, 'Bike App', 'a plain name is read too');
+  assert.equal(one({ source: { identifier: 'com.example.ring' } }).source, 'unknown', 'an object without a name');
+  // Never guessed from the samples inside the workout: they come from whatever was recording then.
+  assert.equal(one({ heartRateData: [{ Avg: 140, Max: 160, source: 'Chest Strap' }], activeEnergy: [{ qty: 1, units: 'kcal', source: 'Watch' }] }).source, 'unknown');
 
   assert.equal(one({ activeEnergyBurned: { qty: 1338.9, units: 'kJ' } }).active_kcal, 320);
   assert.equal(one({ activeEnergy: { qty: 300, units: 'kcal' } }).active_kcal, 300, 'Version 1 sends one object');
@@ -95,23 +104,40 @@ test('optional fields: fallbacks for energy, heart rate and source; kJ is conver
   assert.deepEqual([fromSeries.avg_hr_bpm, fromSeries.max_hr_bpm], [140, 172]);
 });
 
-test('Version 1 (no id or duration), Oura-sourced and malformed workouts', () => {
+test('Version 1 (no id or duration), Oura-written and malformed workouts', () => {
   const v1 = { name: 'Running', start: '2026-10-07 06:00:00 -0700', end: '2026-10-07 06:25:30 -0700', activeEnergy: { qty: 250, units: 'kcal' } };
   const parsed = parse([
     v1,
-    { ...ride('2026-10-07', { id: 'oura-1' }), source: 'Oura' },
+    { ...ride('2026-10-07', { id: 'oura-1', start: '18:00:00' }), name: 'Walk', source: { name: 'Oura', identifier: 'com.ouraring.oura' } },
     { id: 'no-times', name: 'Yoga' },
     { id: 'backwards', name: 'Yoga', start: '2026-10-07 08:00:00 -0700', end: '2026-10-07 07:00:00 -0700' },
     'not a workout',
   ]);
-  assert.deepEqual([parsed.received, parsed.accepted, parsed.skipped], [5, 1, 4]);
-  assert.deepEqual(parsed.skipped_reasons, { oura_source: 1, invalid_workout: 3 });
+  assert.deepEqual([parsed.received, parsed.accepted, parsed.skipped], [5, 2, 3]);
+  assert.deepEqual(parsed.skipped_reasons, { invalid_workout: 3 });
+  // Workouts Oura wrote are kept and labelled as Oura's: an Oura-detected walk may be the only record of it.
+  const oura = parsed.rows[1];
+  assert.deepEqual([oura.name, oura.source, oura.source_id], ['Walk', 'Oura', 'com.ouraring.oura']);
   const row = parsed.rows[0];
   assert.deepEqual([row.name, row.duration_s, row.active_kcal, row.hae_id], ['Running', 1530, 250, undefined]);
   // Without an id the key comes from source, type and end, so a re-send still lands on the same row.
   assert.equal(parse([v1]).rows[0].ts, row.ts);
 
   assert.equal(parseHaeWorkouts({ data: { metrics: [] } }, { timeZone: TZ, now: new Date() }), undefined, 'a Health Metrics push has no workouts list');
+});
+
+test('an Oura workout overlapping a ride keeps its own label; the ride keeps its own', () => {
+  // The ride's heart-rate and energy samples fall inside the Oura workout's window. Both workouts
+  // used to be labelled with the ride's app, because the label was guessed from those samples.
+  const ringCycling = {
+    id: 'ring-1', name: 'Cycling', start: '2026-10-07 18:05:00 -0700', end: '2026-10-07 18:22:00 -0700', duration: 1020,
+    activeEnergyBurned: { qty: 140, units: 'kcal' },
+    heartRateData: [{ date: '2026-10-07 18:15:00 -0700', Min: 120, Avg: 135, Max: 150, units: 'bpm', source: 'Bike App' }],
+    source: { name: 'Oura', identifier: 'com.ouraring.oura' },
+  };
+  const bikeRide = { ...ride('2026-10-07', { id: 'bike-1', start: '18:15:00', minutes: 6, kcal: 60 }) };
+  const rows = parse([ringCycling, bikeRide]).rows;
+  assert.deepEqual(rows.map((w) => [w.name, w.source]), [['Cycling', 'Oura'], ['Indoor Cycling', 'Bike App']]);
 });
 
 test('re-sends are stored once; the same workout with updated numbers is rewritten in place', async () => {
@@ -206,10 +232,10 @@ test('end to end: a Workouts push through the ingest endpoint, then get_workouts
   const satPm = { id: 'sat-pm', name: 'Walking', start: '2026-09-26 17:15:00 -0700', end: '2026-09-26 17:45:00 -0700', duration: 1800, source: 'Watch' };
   const lateFri = ride('2026-09-25', { id: 'late', start: '23:50:00', minutes: 20, kcal: 150, extra: { end: '2026-09-26 00:10:00 -0700' } }); // ends after midnight
 
-  const first = await send([fri, satAm, satPm, lateFri, { ...ride('2026-09-24'), source: 'Oura Ring' }]);
+  const first = await send([fri, satAm, satPm, lateFri, { id: 'bad', name: 'Yoga' }]);
   assert.equal(first.accepted, 0, 'no health-metric samples in a Workouts push');
   assert.deepEqual(first.workouts, {
-    received: 5, accepted: 4, skipped: 1, skipped_reasons: { oura_source: 1 },
+    received: 5, accepted: 4, skipped: 1, skipped_reasons: { invalid_workout: 1 },
     rows_written: 4, rows_unchanged: 0, reconcile: 'on', marked_missing: 0, superseded: 0, restored: 0,
   });
   const again = await send([fri, satAm, satPm, lateFri]);
@@ -262,7 +288,7 @@ test('end to end: a Workouts push through the ingest endpoint, then get_workouts
   assert.ok(logged.includes('"avgHeartRate":{"qty":"<number>","units":"bpm"}') && logged.includes('<2 more>'));
   assert.ok(!logged.includes('480.4') && !logged.includes('"qty":320'));
   const line = logs.find((l) => l.msg === 'hae ingest' && l.workout_types)!;
-  assert.deepEqual(line.workout_types, { 'Indoor Cycling': 4, Walking: 1 });
+  assert.deepEqual(line.workout_types, { 'Indoor Cycling': 3, Walking: 1, Yoga: 1 }, 'every workout received, the malformed one too');
   assert.ok((line.workout_fields as string[]).includes('activeEnergyBurned'));
 });
 
